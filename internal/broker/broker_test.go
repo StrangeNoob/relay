@@ -13,18 +13,27 @@ import (
 	"github.com/StrangeNoob/relay/internal/job"
 )
 
-// newTestBroker connects to a real Redis on a dedicated test DB, flushes it, and
-// returns a broker together with the raw client so tests can assert directly on
-// Redis state. Broker semantics (atomic claim especially) only mean something
-// against real Redis, so we never mock it; if Redis is unreachable the test is
-// skipped rather than failed, so the suite still runs off-CI.
+// testRedisDB is this package's dedicated Redis logical database for tests.
+//
+// `go test ./...` runs each package's test binary in parallel, and every test
+// here flushes its DB — so two packages sharing one DB would wipe and steal each
+// other's jobs mid-test. Each Redis-using test package therefore claims its own
+// DB number (broker uses 15, worker uses 14); a new one should pick another.
+const testRedisDB = 15
+
+// newTestBroker connects to a real Redis on this package's dedicated test DB,
+// flushes it, and returns a broker together with the raw client so tests can
+// assert directly on Redis state. Broker semantics (atomic claim especially)
+// only mean something against real Redis, so we never mock it; if Redis is
+// unreachable the test is skipped rather than failed, so the suite still runs
+// off-CI.
 func newTestBroker(t *testing.T) (*broker.Broker, *redis.Client) {
 	t.Helper()
 	addr := os.Getenv("REDIS_ADDR")
 	if addr == "" {
 		addr = "localhost:6379"
 	}
-	rdb := redis.NewClient(&redis.Options{Addr: addr, DB: 15})
+	rdb := redis.NewClient(&redis.Options{Addr: addr, DB: testRedisDB})
 	ctx := context.Background()
 	if err := rdb.Ping(ctx).Err(); err != nil {
 		t.Skipf("redis not available at %s: %v", addr, err)
