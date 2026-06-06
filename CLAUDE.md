@@ -10,8 +10,20 @@ project: the point is to *prove understanding of queue internals*, not to wrap a
 library. Do not introduce a queue dependency (BullMQ, asynq, Machinery, Celery, etc.) — the
 mechanics are the deliverable.
 
-**Status: pre-implementation.** As of this writing the repo contains only the design spec and
-this file. No Go code exists yet.
+**Status: Phase 1 complete.** The core engine is built, tested against a real Redis under
+`-race`, and CI is green. Repo: <https://github.com/StrangeNoob/relay>. What exists today:
+
+- `internal/job` — the `Job` model + Redis-hash encoding (`ToHash`/`FromHash`).
+- `internal/broker` — `Enqueue`, atomic `Claim`, `Ack`, `Nack`, `Reap`, `Extend` (heartbeat),
+  with Lua under `internal/broker/scripts/`: `claim.lua`, `ack.lua`, `nack.lua`, `reaper.lua`,
+  `heartbeat.lua`.
+- `internal/worker` — `Worker` (claim loop, dispatch, heartbeat, graceful shutdown) and `Reaper`
+  (background reap loop).
+- `cmd/worker`, `cmd/demo` — thin runnable entrypoints (worker pool + reaper; load generator).
+- `.github/workflows/ci.yml` — Redis service + `go test -race` + `golangci-lint`.
+
+Phase 2 (delayed jobs/promoter, priority, backoff+jitter, idempotency enforcement, rate limiting,
+metrics) and Phase 3 (API/dashboard/`cmd/server`, docker-compose, deploy) are **not** built yet.
 
 ## Source of truth
 
@@ -35,6 +47,14 @@ spec disagree, the spec wins until the spec is deliberately updated.
 - **Build from scratch on Redis primitives.** Redis is the durable substrate; the queue logic is
   ours.
 
+## Known limitations (intentional, documented)
+
+- **No fencing token on ack/nack.** `Ack`/`Nack`/reap act on a bare job id. If a worker stalls
+  past its visibility deadline, gets reaped and re-claimed elsewhere, the original worker's late
+  ack/nack can disturb the new claim. This is consistent with at-least-once delivery; per-claim
+  fencing tokens are possible future hardening, not a current guarantee.
+- **`nack` has no backoff yet** (requeues immediately to `ready`) — see lifecycle below.
+
 ## Redis data model & job lifecycle (the architecture in brief)
 
 A job is one Redis hash; its *position in the queue* is membership in one of several per-queue
@@ -43,45 +63,54 @@ and the whole engine follows:
 
 | Key | Type | Score = | Role |
 |---|---|---|---|
-| `job:{id}` | hash | — | full job (payload, state, attempts, maxRetries, deadline, idempotency key) |
-| `q:{name}:ready` | ZSET | priority | claimable now; claim pops the best score |
-| `q:{name}:delayed` | ZSET | ready-at ts | scheduled + backoff jobs; promoter moves due ones to `ready` |
+| `job:{id}` | hash | — | full job. Fields: `id, queue, payload, state, attempts, max_retries, created_at, idempotency_key`. **No deadline field** — the deadline lives only as the `inflight` ZSET score. |
+| `q:{name}:ready` | ZSET | priority | claimable now; claim pops the best score (currently score 0 for all — priority is Phase 2) |
 | `q:{name}:inflight` | ZSET | visibility deadline | claimed-not-acked; **reaper scans this for expiry** |
-| `q:{name}:dlq` | list | — | exhausted jobs; inspect/requeue from API+dashboard |
-| `q:{name}:dedup` | set/hash | — | idempotency keys for optional enqueue dedup |
+| `q:{name}:dlq` | list | — | exhausted jobs (inspect/requeue surface is Phase 3) |
+| `q:{name}:delayed` | ZSET | ready-at ts | **planned (Phase 2)** — scheduled + backoff jobs; promoter moves due ones to `ready` |
+| `q:{name}:dedup` | set/hash | — | **planned (Phase 2)** — idempotency keys for enqueue dedup |
+
+States in use today: `pending` (constructed, not enqueued), `ready`, `inflight`, `dead`. The
+`delayed` state arrives with Phase 2.
 
 Lifecycle (each arrow that must stay atomic is a Lua script — see invariants):
 
 ```
-enqueue → ready (or delayed) → [CLAIM: ready→inflight, deadline=now+vt, attempts++] → process
+enqueue → ready → [CLAIM: ready→inflight, deadline=now+vt, attempts++] → process
   ack   → remove from inflight + delete job
-  nack  → attempts<maxRetries ? delayed (backoff+jitter) : dlq
-  reaper   (bg): inflight where deadline<now  → ready     # at-least-once on crash
-  promoter (bg): delayed   where ready-at<now → ready
+  nack  → attempts<maxRetries ? ready : dlq        # backoff via `delayed` is Phase 2
+  reaper (bg): inflight where deadline<=now → ready # at-least-once on crash
 ```
 
-Two background loops (reaper, promoter) plus the worker claim loop are the only things that move
-jobs between states. Heartbeat extends a job's `inflight` deadline for long-running handlers.
+Current reality vs. spec target: `nack` requeues straight to `ready` with no delay — exponential
+backoff + jitter (re-queue via `delayed`) and the **promoter** loop are Phase 2. Today the only
+background loop is the reaper; together with the worker claim loop they are the only things that
+move jobs between states. Heartbeat (`broker.Extend`, `ZADD XX`) pushes a job's `inflight`
+deadline forward while a long handler runs, so the reaper does not reclaim live work.
 
-## Intended layout (per spec — create as you build)
+## Layout (✅ built · ◻ planned)
 
 ```
-cmd/{server,worker,demo}/main.go   # API+dashboard server, worker daemon, demo load generator
-internal/broker/                   # core engine: enqueue/claim/ack/nack/reaper/promoter
-internal/broker/scripts/*.lua      # atomic Lua scripts, embedded via go:embed
-internal/{job,worker,client,api,metrics}/
-web/                               # embedded dashboard assets (plain JS via go:embed, no SPA build)
-deployments/docker-compose.yml     # redis + server + N workers + demo
-.github/workflows/ci.yml
+cmd/worker/main.go                 # ✅ worker pool + reaper daemon
+cmd/demo/main.go                   # ✅ load generator
+cmd/server/main.go                 # ◻ API+dashboard server (Phase 3)
+internal/job/                      # ✅ job model + hash encoding
+internal/broker/                   # ✅ enqueue/claim/ack/nack/reap/extend  (◻ promoter — Phase 2)
+internal/broker/scripts/*.lua      # ✅ claim, ack, nack, reaper, heartbeat (embedded via go:embed)
+internal/worker/                   # ✅ Worker + Reaper runtime
+internal/{client,api,metrics}/     # ◻ producer SDK / HTTP API / Prometheus (Phase 2–3)
+web/                               # ◻ embedded dashboard assets (Phase 3)
+deployments/docker-compose.yml     # ◻ redis + server + N workers + demo (Phase 3)
+.github/workflows/ci.yml           # ✅ Redis service + go test -race + golangci-lint
 ```
 
 Use `internal/` for everything not meant as a public import surface. `cmd/` holds only thin
-`main` wiring.
+`main` wiring — the demo handler in `cmd/worker` is scaffolding, not core logic.
 
 ## Build order (do not jump ahead)
 
-1. **Phase 1 — core:** job model; enqueue/claim/ack/nack Lua; reaper; worker runtime; basic DLQ; integration tests; CI. Ship a working, testable queue before anything else.
-2. **Phase 2 — depth:** delayed jobs + promoter; priority; backoff + jitter; idempotency; per-queue rate limiting; Prometheus metrics.
+1. **Phase 1 — core: ✅ done.** job model; enqueue/claim/ack/nack Lua; reaper; worker runtime; basic DLQ; integration tests; CI. A working, testable queue ships first.
+2. **Phase 2 — depth (next):** delayed jobs + promoter; priority; backoff + jitter; idempotency; per-queue rate limiting; Prometheus metrics.
 3. **Phase 3 — polish:** dashboard; docker-compose demo; deployed demo; README + diagram.
 4. **Future work (NOT now):** Postgres-backed (`SKIP LOCKED`) mode; exactly-once via consumer outbox.
 
@@ -97,15 +126,25 @@ Use `internal/` for everything not meant as a public import surface. `cmd/` hold
 - **Errors:** wrap with `%w`; never silently swallow. Worker shutdown is graceful (stop claiming,
   finish or nack in-flight, exit clean).
 
-## Build commands
+## Build & dependencies
 
-No build tooling exists yet. Once `go.mod` is initialized, the expected commands are:
+- **Module:** `github.com/StrangeNoob/relay`.
+- **Toolchain:** `go 1.24` with `toolchain go1.25.11` pinned in `go.mod` (go-redis v9 needs ≥1.24).
+  If a `go1.24` toolchain download fails, the pin makes the build use the already-cached 1.25.x.
+- **Only dependency:** `github.com/redis/go-redis/v9` — a Redis *driver*, not a queue library; it
+  does not violate the "no queue dependency" rule. The queue logic is ours.
+- **Tests need a real Redis** at `localhost:6379` (override with `REDIS_ADDR`). They use **DB 15**
+  and `FlushDB` per test, and **skip** (not fail) when Redis is unreachable — so a green local run
+  with no Redis means the broker/worker suites were skipped. CI provides a Redis service.
 
 ```sh
 go build ./...
-go test -race ./...
-golangci-lint run
-docker compose -f deployments/docker-compose.yml up   # full local stack + demo load
+go test -race ./...                         # needs Redis on :6379 (or REDIS_ADDR)
+golangci-lint run                            # CI pins v2.12.2; default linters, currently clean
+
+# run it end to end against a local Redis:
+go run ./cmd/worker -queue demo -concurrency 4 &   # worker pool + reaper
+go run ./cmd/demo   -queue demo -count 100         # enqueue load
 ```
 
-Keep this section updated as the Makefile / CI take shape.
+Keep this section updated as the Makefile / docker-compose take shape.
