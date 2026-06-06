@@ -35,6 +35,34 @@ spec disagree, the spec wins until the spec is deliberately updated.
 - **Build from scratch on Redis primitives.** Redis is the durable substrate; the queue logic is
   ours.
 
+## Redis data model & job lifecycle (the architecture in brief)
+
+A job is one Redis hash; its *position in the queue* is membership in one of several per-queue
+ZSETs, keyed by `q:{name}:`. The ZSET **score is the mechanism** in each case — read the scores,
+and the whole engine follows:
+
+| Key | Type | Score = | Role |
+|---|---|---|---|
+| `job:{id}` | hash | — | full job (payload, state, attempts, maxRetries, deadline, idempotency key) |
+| `q:{name}:ready` | ZSET | priority | claimable now; claim pops the best score |
+| `q:{name}:delayed` | ZSET | ready-at ts | scheduled + backoff jobs; promoter moves due ones to `ready` |
+| `q:{name}:inflight` | ZSET | visibility deadline | claimed-not-acked; **reaper scans this for expiry** |
+| `q:{name}:dlq` | list | — | exhausted jobs; inspect/requeue from API+dashboard |
+| `q:{name}:dedup` | set/hash | — | idempotency keys for optional enqueue dedup |
+
+Lifecycle (each arrow that must stay atomic is a Lua script — see invariants):
+
+```
+enqueue → ready (or delayed) → [CLAIM: ready→inflight, deadline=now+vt, attempts++] → process
+  ack   → remove from inflight + delete job
+  nack  → attempts<maxRetries ? delayed (backoff+jitter) : dlq
+  reaper   (bg): inflight where deadline<now  → ready     # at-least-once on crash
+  promoter (bg): delayed   where ready-at<now → ready
+```
+
+Two background loops (reaper, promoter) plus the worker claim loop are the only things that move
+jobs between states. Heartbeat extends a job's `inflight` deadline for long-running handlers.
+
 ## Intended layout (per spec — create as you build)
 
 ```
