@@ -250,6 +250,105 @@ func TestNackDeadLettersWhenExhausted(t *testing.T) {
 	}
 }
 
+func TestReapRequeuesExpiredJob(t *testing.T) {
+	b, rdb := newTestBroker(t)
+	ctx := context.Background()
+
+	j := job.New("emails", []byte("hello"))
+	if err := b.Enqueue(ctx, j); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	// Visibility 0 sets the deadline to the claim instant, so by the time Reap
+	// reads the clock the job is already past due — no sleeping, no flakiness.
+	claimed, ok, err := b.Claim(ctx, "emails", 0)
+	if err != nil || !ok {
+		t.Fatalf("Claim: err=%v ok=%v", err, ok)
+	}
+
+	n, err := b.Reap(ctx, "emails")
+	if err != nil {
+		t.Fatalf("Reap: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("reaped %d jobs, want 1", n)
+	}
+
+	if c, _ := rdb.ZCard(ctx, "q:emails:inflight").Result(); c != 0 {
+		t.Errorf("inflight size = %d, want 0 after reap", c)
+	}
+	members, _ := rdb.ZRange(ctx, "q:emails:ready", 0, -1).Result()
+	if len(members) != 1 || members[0] != claimed.ID {
+		t.Errorf("ready set = %v, want requeued [%s]", members, claimed.ID)
+	}
+	state, _ := rdb.HGet(ctx, "job:"+claimed.ID, "state").Result()
+	if state != string(job.StateReady) {
+		t.Errorf("job state = %q, want %q", state, job.StateReady)
+	}
+}
+
+func TestReapLeavesUnexpiredJobs(t *testing.T) {
+	b, rdb := newTestBroker(t)
+	ctx := context.Background()
+
+	// A full minute of visibility: the job is nowhere near its deadline.
+	claimed := claimOne(t, b, job.New("emails", []byte("hello")))
+
+	n, err := b.Reap(ctx, "emails")
+	if err != nil {
+		t.Fatalf("Reap: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("reaped %d jobs, want 0 (none expired)", n)
+	}
+
+	if c, _ := rdb.ZCard(ctx, "q:emails:inflight").Result(); c != 1 {
+		t.Errorf("inflight size = %d, want 1 (job still in flight)", c)
+	}
+	if c, _ := rdb.ZCard(ctx, "q:emails:ready").Result(); c != 0 {
+		t.Errorf("ready size = %d, want 0 (job must not be requeued early)", c)
+	}
+	_ = claimed
+}
+
+// TestReapEnablesRedeliveryAfterCrash is the at-least-once-on-crash guarantee
+// end to end: a worker claims a job and dies without acking; the reaper returns
+// it to ready; a second worker re-claims the same job with its attempt count
+// advanced. Composed of already-unit-tested steps, kept as a scenario guard.
+func TestReapEnablesRedeliveryAfterCrash(t *testing.T) {
+	b, _ := newTestBroker(t)
+	ctx := context.Background()
+
+	j := job.New("emails", []byte("hello"))
+	if err := b.Enqueue(ctx, j); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	// First worker claims with visibility 0, then "crashes" (never acks).
+	first, ok, err := b.Claim(ctx, "emails", 0)
+	if err != nil || !ok {
+		t.Fatalf("first Claim: err=%v ok=%v", err, ok)
+	}
+	if first.Attempts != 1 {
+		t.Errorf("first claim Attempts = %d, want 1", first.Attempts)
+	}
+
+	if n, err := b.Reap(ctx, "emails"); err != nil || n != 1 {
+		t.Fatalf("Reap: n=%d err=%v, want 1", n, err)
+	}
+
+	// A second worker re-claims the same job; the attempt count advances.
+	second, ok, err := b.Claim(ctx, "emails", time.Minute)
+	if err != nil || !ok {
+		t.Fatalf("re-Claim: err=%v ok=%v", err, ok)
+	}
+	if second.ID != first.ID {
+		t.Errorf("re-claimed job %s, want the same job %s", second.ID, first.ID)
+	}
+	if second.Attempts != 2 {
+		t.Errorf("re-claim Attempts = %d, want 2", second.Attempts)
+	}
+}
+
 // TestConcurrentClaimsDeliverEachJobOnce is the competing-consumer safety check:
 // many workers hammer one queue at once and every job must be claimed exactly
 // once. If the claim were not atomic (e.g. peek-then-remove as two round-trips),

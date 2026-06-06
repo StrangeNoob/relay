@@ -121,6 +121,28 @@ func (b *Broker) Nack(ctx context.Context, j job.Job) error {
 	return nil
 }
 
+// defaultReapBatch bounds how many jobs a single Reap pass requeues, so one
+// call can never block Redis scanning a huge inflight backlog. Callers run Reap
+// in a loop until it returns 0 to drain everything.
+const defaultReapBatch = 100
+
+// Reap requeues jobs whose visibility deadline has passed: workers that claimed
+// them have crashed or stalled without acking. Each expired job is moved from
+// inflight back to ready (atomically, in reaper.lua), which is what makes
+// at-least-once delivery survive a worker crash. It returns the number of jobs
+// requeued in this pass; a return of defaultReapBatch means more may remain, so
+// call again.
+func (b *Broker) Reap(ctx context.Context, queue string) (int, error) {
+	n, err := reaperScript.Run(ctx, b.rdb,
+		[]string{inflightKey(queue), readyKey(queue)},
+		time.Now().UnixMilli(), jobKeyPrefix, defaultReapBatch,
+	).Int()
+	if err != nil {
+		return 0, fmt.Errorf("broker: reaping %q: %w", queue, err)
+	}
+	return n, nil
+}
+
 // hashFromLua converts the flat HGETALL array a script returns (alternating
 // field, value, field, value …) into a Go map. go-redis decodes a Lua table as
 // []interface{} of strings.

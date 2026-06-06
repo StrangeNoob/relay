@@ -25,3 +25,8 @@ var ackScript = redis.NewScript(ackSrc)
 var nackSrc string
 
 var nackScript = redis.NewScript(nackSrc)
+
+//go:embed scripts/reaper.lua
+var reaperSrc string
+
+var reaperScript = redis.NewScript(reaperSrc)
