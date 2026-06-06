@@ -23,6 +23,15 @@ type State string
 const (
 	// StatePending is a job that has been constructed but not yet enqueued.
 	StatePending State = "pending"
+	// StateInFlight is a job that has been claimed by a worker and is being
+	// processed; it sits in the inflight set under a visibility deadline.
+	StateInFlight State = "inflight"
+	// StateReady is a job waiting in a ready set to be claimed — either freshly
+	// enqueued or requeued after a failed attempt.
+	StateReady State = "ready"
+	// StateDead is a job that exhausted its retry budget and was moved to the
+	// dead-letter queue for inspection.
+	StateDead State = "dead"
 )
 
 // DefaultMaxRetries is the retry budget a job gets when New is not told
