@@ -143,6 +143,23 @@ func (b *Broker) Reap(ctx context.Context, queue string) (int, error) {
 	return n, nil
 }
 
+// Extend pushes a claimed job's visibility deadline to now+visibility, the
+// heartbeat a worker sends while a long handler is still running so the reaper
+// does not reclaim it. It returns false (without error) when the job is no
+// longer in flight — already acked or already reaped — and in that case must not
+// re-add it to the inflight set. The check and the re-score are atomic in
+// heartbeat.lua.
+func (b *Broker) Extend(ctx context.Context, j job.Job, visibility time.Duration) (bool, error) {
+	n, err := heartbeatScript.Run(ctx, b.rdb,
+		[]string{inflightKey(j.Queue)},
+		j.ID, time.Now().UnixMilli(), visibility.Milliseconds(),
+	).Int()
+	if err != nil {
+		return false, fmt.Errorf("broker: extending job %s: %w", j.ID, err)
+	}
+	return n == 1, nil
+}
+
 // hashFromLua converts the flat HGETALL array a script returns (alternating
 // field, value, field, value …) into a Go map. go-redis decodes a Lua table as
 // []interface{} of strings.

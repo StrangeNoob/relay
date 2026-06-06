@@ -30,3 +30,8 @@ var nackScript = redis.NewScript(nackSrc)
 var reaperSrc string
 
 var reaperScript = redis.NewScript(reaperSrc)
+
+//go:embed scripts/heartbeat.lua
+var heartbeatSrc string
+
+var heartbeatScript = redis.NewScript(heartbeatSrc)

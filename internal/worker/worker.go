@@ -29,17 +29,44 @@ const (
 
 // Worker claims from a single queue and dispatches to one handler.
 type Worker struct {
-	broker       *broker.Broker
-	queue        string
-	handler      Handler
-	visibility   time.Duration
-	pollInterval time.Duration
-	logger       *slog.Logger
+	broker            *broker.Broker
+	queue             string
+	handler           Handler
+	visibility        time.Duration
+	pollInterval      time.Duration
+	heartbeatInterval time.Duration
+	logger            *slog.Logger
 }
 
-// New builds a worker for the given queue and handler with sane defaults.
-func New(b *broker.Broker, queue string, handler Handler) *Worker {
-	return &Worker{
+// Option customises a Worker at construction.
+type Option func(*Worker)
+
+// WithVisibility sets how long a claimed job stays invisible to other workers.
+func WithVisibility(d time.Duration) Option {
+	return func(w *Worker) { w.visibility = d }
+}
+
+// WithHeartbeatInterval sets how often a running handler's deadline is extended.
+// It should be comfortably smaller than the visibility timeout. When unset it
+// defaults to a third of the visibility timeout.
+func WithHeartbeatInterval(d time.Duration) Option {
+	return func(w *Worker) { w.heartbeatInterval = d }
+}
+
+// WithPollInterval sets how long the loop waits before retrying an empty queue.
+func WithPollInterval(d time.Duration) Option {
+	return func(w *Worker) { w.pollInterval = d }
+}
+
+// WithLogger sets the logger used for non-fatal errors.
+func WithLogger(l *slog.Logger) Option {
+	return func(w *Worker) { w.logger = l }
+}
+
+// New builds a worker for the given queue and handler. Defaults are sane; pass
+// options to tune timings or the logger.
+func New(b *broker.Broker, queue string, handler Handler, opts ...Option) *Worker {
+	w := &Worker{
 		broker:       b,
 		queue:        queue,
 		handler:      handler,
@@ -47,6 +74,15 @@ func New(b *broker.Broker, queue string, handler Handler) *Worker {
 		pollInterval: defaultPollInterval,
 		logger:       slog.Default(),
 	}
+	for _, opt := range opts {
+		opt(w)
+	}
+	// Heartbeat thrice per visibility window unless the caller chose otherwise,
+	// so a deadline is refreshed well before it can expire.
+	if w.heartbeatInterval <= 0 {
+		w.heartbeatInterval = w.visibility / 3
+	}
+	return w
 }
 
 // Run claims and processes jobs until ctx is cancelled, then returns nil. On
@@ -89,6 +125,12 @@ func (w *Worker) process(ctx context.Context, j job.Job) {
 	// acked or nacked, even when shutdown was signalled mid-handler.
 	finishCtx := context.WithoutCancel(ctx)
 
+	// Keep the job's visibility deadline ahead of the reaper for as long as the
+	// handler runs. Heartbeats also use the detached context so a graceful
+	// shutdown does not let the in-flight job be reclaimed before it finishes.
+	stopHeartbeat := w.startHeartbeat(finishCtx, j)
+	defer stopHeartbeat()
+
 	if herr := w.handler(ctx, j); herr != nil {
 		w.logger.Warn("relay worker: handler failed, nacking", "job", j.ID, "err", herr)
 		if err := w.broker.Nack(finishCtx, j); err != nil {
@@ -98,6 +140,40 @@ func (w *Worker) process(ctx context.Context, j job.Job) {
 	}
 	if err := w.broker.Ack(finishCtx, j); err != nil {
 		w.logger.Error("relay worker: ack failed", "job", j.ID, "err", err)
+	}
+}
+
+// startHeartbeat launches a goroutine that extends j's visibility deadline every
+// heartbeatInterval until the returned stop function is called. The stop
+// function waits for the goroutine to exit, so no Extend can run after process
+// returns. The heartbeat also stops on its own if a beat reports the job is no
+// longer in flight (already acked or reaped).
+func (w *Worker) startHeartbeat(ctx context.Context, j job.Job) (stop func()) {
+	done := make(chan struct{})
+	stopped := make(chan struct{})
+	go func() {
+		defer close(done)
+		t := time.NewTicker(w.heartbeatInterval)
+		defer t.Stop()
+		for {
+			select {
+			case <-stopped:
+				return
+			case <-t.C:
+				ok, err := w.broker.Extend(ctx, j, w.visibility)
+				if err != nil {
+					w.logger.Error("relay worker: heartbeat failed", "job", j.ID, "err", err)
+					return
+				}
+				if !ok {
+					return // job no longer in flight; nothing to extend
+				}
+			}
+		}
+	}()
+	return func() {
+		close(stopped)
+		<-done
 	}
 }
 

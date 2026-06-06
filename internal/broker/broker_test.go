@@ -250,6 +250,51 @@ func TestNackDeadLettersWhenExhausted(t *testing.T) {
 	}
 }
 
+func TestExtendPushesDeadlineForward(t *testing.T) {
+	b, rdb := newTestBroker(t)
+	ctx := context.Background()
+
+	claimed := claimOne(t, b, job.New("emails", []byte("hello")))
+	before, err := rdb.ZScore(ctx, "q:emails:inflight", claimed.ID).Result()
+	if err != nil {
+		t.Fatalf("precondition ZScore: %v", err)
+	}
+
+	ok, err := b.Extend(ctx, claimed, time.Hour)
+	if err != nil {
+		t.Fatalf("Extend: %v", err)
+	}
+	if !ok {
+		t.Fatal("Extend returned false, want true for an in-flight job")
+	}
+
+	after, err := rdb.ZScore(ctx, "q:emails:inflight", claimed.ID).Result()
+	if err != nil {
+		t.Fatalf("ZScore after: %v", err)
+	}
+	if after <= before {
+		t.Errorf("deadline not extended: before=%v after=%v", before, after)
+	}
+}
+
+func TestExtendReturnsFalseWhenNotInflight(t *testing.T) {
+	b, rdb := newTestBroker(t)
+	ctx := context.Background()
+
+	// A job that was never claimed is not in the inflight set.
+	j := job.New("emails", []byte("hello"))
+	ok, err := b.Extend(ctx, j, time.Hour)
+	if err != nil {
+		t.Fatalf("Extend: %v", err)
+	}
+	if ok {
+		t.Errorf("Extend returned true for a job that is not in flight")
+	}
+	if n, _ := rdb.ZCard(ctx, "q:emails:inflight").Result(); n != 0 {
+		t.Errorf("Extend wrongly added a non-inflight job to inflight (size=%d)", n)
+	}
+}
+
 func TestReapRequeuesExpiredJob(t *testing.T) {
 	b, rdb := newTestBroker(t)
 	ctx := context.Background()

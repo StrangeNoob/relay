@@ -115,6 +115,93 @@ func TestWorkerNacksJobOnHandlerError(t *testing.T) {
 	}
 }
 
+func TestReaperRunRequeuesExpiredJobs(t *testing.T) {
+	b, rdb := newTestBroker(t)
+	ctx := context.Background()
+
+	j := job.New("emails", []byte("hello"))
+	if err := b.Enqueue(ctx, j); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	// Claim with visibility 0 so the job is immediately past due in inflight.
+	if _, ok, err := b.Claim(ctx, "emails", 0); err != nil || !ok {
+		t.Fatalf("Claim: err=%v ok=%v", err, ok)
+	}
+
+	r := worker.NewReaper(b, "emails", 20*time.Millisecond)
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- r.Run(runCtx) }()
+
+	// Wait for the background reaper to move the job back to ready.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if n, _ := rdb.ZCard(ctx, "q:emails:ready").Result(); n == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("reaper did not requeue the expired job within 2s")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	cancel()
+	if err := <-done; err != nil {
+		t.Errorf("Run returned %v, want nil", err)
+	}
+
+	if n, _ := rdb.ZCard(ctx, "q:emails:inflight").Result(); n != 0 {
+		t.Errorf("inflight size = %d, want 0 after reaper run", n)
+	}
+}
+
+func TestWorkerHeartbeatsExtendDeadline(t *testing.T) {
+	b, rdb := newTestBroker(t)
+	ctx := context.Background()
+
+	j := job.New("emails", []byte("hello"))
+	if err := b.Enqueue(ctx, j); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	handler := func(_ context.Context, _ job.Job) error {
+		close(started)
+		<-release // hold the job in flight long enough to heartbeat
+		return nil
+	}
+	w := worker.New(b, "emails", handler,
+		worker.WithVisibility(200*time.Millisecond),
+		worker.WithHeartbeatInterval(40*time.Millisecond),
+	)
+
+	runCtx, cancel := context.WithCancel(ctx)
+	done := make(chan error, 1)
+	go func() { done <- w.Run(runCtx) }()
+
+	<-started
+	d1, err := rdb.ZScore(ctx, "q:emails:inflight", j.ID).Result()
+	if err != nil {
+		t.Fatalf("ZScore d1: %v", err)
+	}
+	time.Sleep(150 * time.Millisecond) // several heartbeat intervals
+	d2, err := rdb.ZScore(ctx, "q:emails:inflight", j.ID).Result()
+	if err != nil {
+		t.Fatalf("ZScore d2: %v", err)
+	}
+	if d2 <= d1 {
+		t.Errorf("deadline not advanced by heartbeat: d1=%v d2=%v", d1, d2)
+	}
+
+	close(release)
+	cancel()
+	if err := <-done; err != nil {
+		t.Errorf("Run returned %v, want nil", err)
+	}
+}
+
 func TestWorkerFinishesInflightJobOnShutdown(t *testing.T) {
 	b, rdb := newTestBroker(t)
 	ctx := context.Background()
