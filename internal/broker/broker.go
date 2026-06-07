@@ -236,7 +236,7 @@ const defaultPromoteBatch = 100
 func (b *Broker) Reap(ctx context.Context, queue string) (int, error) {
 	n, err := reaperScript.Run(ctx, b.rdb,
 		[]string{inflightKey(queue), readyKey(queue)},
-		time.Now().UnixMilli(), jobKeyPrefix, defaultReapBatch,
+		time.Now().UnixMilli(), jobKeyPrefix, defaultReapBatch, priorityScale,
 	).Int()
 	if err != nil {
 		return 0, fmt.Errorf("broker: reaping %q: %w", queue, err)
@@ -251,7 +251,7 @@ func (b *Broker) Reap(ctx context.Context, queue string) (int, error) {
 func (b *Broker) Promote(ctx context.Context, queue string) (int, error) {
 	n, err := promoteScript.Run(ctx, b.rdb,
 		[]string{delayedKey(queue), readyKey(queue)},
-		time.Now().UnixMilli(), jobKeyPrefix, defaultPromoteBatch,
+		time.Now().UnixMilli(), jobKeyPrefix, defaultPromoteBatch, priorityScale,
 	).Int()
 	if err != nil {
 		return 0, fmt.Errorf("broker: promoting %q: %w", queue, err)

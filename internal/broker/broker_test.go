@@ -555,10 +555,12 @@ func TestPromoteMovesDueJob(t *testing.T) {
 		t.Fatalf("ZAdd: %v", err)
 	}
 
+	before := time.Now().UnixMilli()
 	n, err := b.Promote(ctx, "emails")
 	if err != nil {
 		t.Fatalf("Promote: %v", err)
 	}
+	after := time.Now().UnixMilli()
 	if n != 1 {
 		t.Errorf("promoted %d jobs, want 1", n)
 	}
@@ -578,8 +580,9 @@ func TestPromoteMovesDueJob(t *testing.T) {
 		t.Errorf("attempts = %q, want 0 (promotion must not count as a delivery)", attempts)
 	}
 	score, _ := rdb.ZScore(ctx, "q:emails:ready", j.ID).Result()
-	if score != 0 {
-		t.Errorf("ready score = %v, want 0", score)
+	// priority 0 → readyScore(0, now) == -now, where now is the promotion time.
+	if score < -float64(after) || score > -float64(before) {
+		t.Errorf("ready score = %v, want within [%v, %v]", score, -float64(after), -float64(before))
 	}
 }
 
@@ -732,6 +735,70 @@ func TestWithPriorityZeroOverridesJobPriority(t *testing.T) {
 	}
 	if p, _ := rdb.HGet(ctx, "job:"+j.ID, "priority").Result(); p != "0" {
 		t.Errorf("priority = %q, want 0 (WithPriority(0) must override job.Priority=7)", p)
+	}
+}
+
+func TestPromotePreservesPriority(t *testing.T) {
+	b, rdb := newTestBroker(t)
+	ctx := context.Background()
+
+	mid := job.New("emails", []byte("mid"))
+	mid.Priority = 3
+	if err := b.Enqueue(ctx, mid); err != nil {
+		t.Fatalf("Enqueue mid: %v", err)
+	}
+	high := job.New("emails", []byte("high"))
+	high.Priority = 7
+	if err := b.Enqueue(ctx, high, broker.WithDelay(time.Hour)); err != nil {
+		t.Fatalf("Enqueue high: %v", err)
+	}
+	// Force the delayed job due now so Promote picks it up this pass.
+	if err := rdb.ZAdd(ctx, "q:emails:delayed",
+		redis.Z{Score: float64(time.Now().Add(-time.Millisecond).UnixMilli()), Member: high.ID}).Err(); err != nil {
+		t.Fatalf("ZAdd: %v", err)
+	}
+	if n, err := b.Promote(ctx, "emails"); err != nil || n != 1 {
+		t.Fatalf("Promote: n=%d err=%v, want 1", n, err)
+	}
+
+	got, ok, err := b.Claim(ctx, "emails", time.Minute)
+	if err != nil || !ok {
+		t.Fatalf("Claim: err=%v ok=%v", err, ok)
+	}
+	if got.ID != high.ID || got.Priority != 7 {
+		t.Errorf("claimed id=%s prio=%d, want high id=%s prio=7", got.ID, got.Priority, high.ID)
+	}
+}
+
+func TestReapPreservesPriority(t *testing.T) {
+	b, _ := newTestBroker(t)
+	ctx := context.Background()
+
+	high := job.New("emails", []byte("high"))
+	high.Priority = 8
+	if err := b.Enqueue(ctx, high); err != nil {
+		t.Fatalf("Enqueue high: %v", err)
+	}
+	// visibility 0 sets the inflight deadline to the claim's now; Reap passes its
+	// own now (>= that), so the job is immediately eligible to be reaped.
+	if _, ok, err := b.Claim(ctx, "emails", 0); err != nil || !ok {
+		t.Fatalf("Claim high: err=%v ok=%v", err, ok)
+	}
+	mid := job.New("emails", []byte("mid"))
+	mid.Priority = 3
+	if err := b.Enqueue(ctx, mid); err != nil {
+		t.Fatalf("Enqueue mid: %v", err)
+	}
+	if n, err := b.Reap(ctx, "emails"); err != nil || n != 1 {
+		t.Fatalf("Reap: n=%d err=%v, want 1", n, err)
+	}
+
+	got, ok, err := b.Claim(ctx, "emails", time.Minute)
+	if err != nil || !ok {
+		t.Fatalf("Claim: err=%v ok=%v", err, ok)
+	}
+	if got.ID != high.ID || got.Priority != 8 {
+		t.Errorf("claimed id=%s prio=%d, want high id=%s prio=8", got.ID, got.Priority, high.ID)
 	}
 }
 

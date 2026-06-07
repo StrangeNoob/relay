@@ -14,18 +14,22 @@
 -- ARGV[1] = now in unix milliseconds
 -- ARGV[2] = job hash key prefix ("job:")
 -- ARGV[3] = max jobs to requeue in this pass (bounds the work per call)
+-- ARGV[4] = priority scale (weights priority above time in the ready score)
 --
 -- Returns the number of jobs requeued.
 
 local now = tonumber(ARGV[1])
 local prefix = ARGV[2]
 local limit = tonumber(ARGV[3])
+local scale = tonumber(ARGV[4])
 
 local expired = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', now, 'LIMIT', 0, limit)
 for _, id in ipairs(expired) do
+  local job_key = prefix .. id
   redis.call('ZREM', KEYS[1], id)
-  redis.call('HSET', prefix .. id, 'state', 'ready')
-  redis.call('ZADD', KEYS[2], 0, id)
+  redis.call('HSET', job_key, 'state', 'ready')
+  local priority = tonumber(redis.call('HGET', job_key, 'priority')) or 0
+  redis.call('ZADD', KEYS[2], priority * scale - now, id)
 end
 
 return #expired
