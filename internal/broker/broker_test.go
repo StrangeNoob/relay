@@ -611,6 +611,130 @@ func TestPromoteLeavesNotDueJobs(t *testing.T) {
 // many workers hammer one queue at once and every job must be claimed exactly
 // once. If the claim were not atomic (e.g. peek-then-remove as two round-trips),
 // two workers could grab the same id and this would catch it. Run under -race.
+func TestEnqueueWithPrioritySetsScore(t *testing.T) {
+	b, rdb := newTestBroker(t)
+	ctx := context.Background()
+
+	j := job.New("emails", []byte("x"))
+	before := time.Now().UnixMilli()
+	if err := b.Enqueue(ctx, j, broker.WithPriority(5)); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	after := time.Now().UnixMilli()
+
+	if p, _ := rdb.HGet(ctx, "job:"+j.ID, "priority").Result(); p != "5" {
+		t.Errorf("hash priority = %q, want 5", p)
+	}
+	score, err := rdb.ZScore(ctx, "q:emails:ready", j.ID).Result()
+	if err != nil {
+		t.Fatalf("ZScore: %v", err)
+	}
+	// score = priority*priorityScale - nowMs; scale is 1e13 (see priority.go).
+	lo := 5*1e13 - float64(after)
+	hi := 5*1e13 - float64(before)
+	if score < lo || score > hi {
+		t.Errorf("ready score = %v, want within [%v, %v]", score, lo, hi)
+	}
+}
+
+func TestEnqueueClampsPriority(t *testing.T) {
+	b, rdb := newTestBroker(t)
+	ctx := context.Background()
+
+	hi := job.New("emails", []byte("hi"))
+	if err := b.Enqueue(ctx, hi, broker.WithPriority(300)); err != nil {
+		t.Fatalf("Enqueue hi: %v", err)
+	}
+	if p, _ := rdb.HGet(ctx, "job:"+hi.ID, "priority").Result(); p != "255" {
+		t.Errorf("clamped-high priority = %q, want 255", p)
+	}
+
+	lo := job.New("emails", []byte("lo"))
+	if err := b.Enqueue(ctx, lo, broker.WithPriority(-5)); err != nil {
+		t.Fatalf("Enqueue lo: %v", err)
+	}
+	if p, _ := rdb.HGet(ctx, "job:"+lo.ID, "priority").Result(); p != "0" {
+		t.Errorf("clamped-low priority = %q, want 0", p)
+	}
+}
+
+func TestClaimReturnsHighestPriorityFirst(t *testing.T) {
+	b, _ := newTestBroker(t)
+	ctx := context.Background()
+
+	low := job.New("emails", []byte("low"))
+	low.Priority = 1
+	mid := job.New("emails", []byte("mid"))
+	mid.Priority = 5
+	high := job.New("emails", []byte("high"))
+	high.Priority = 9
+	for _, j := range []job.Job{mid, low, high} {
+		if err := b.Enqueue(ctx, j); err != nil {
+			t.Fatalf("Enqueue: %v", err)
+		}
+	}
+
+	want := []struct {
+		id   string
+		prio int
+	}{{high.ID, 9}, {mid.ID, 5}, {low.ID, 1}}
+	for i, w := range want {
+		got, ok, err := b.Claim(ctx, "emails", time.Minute)
+		if err != nil || !ok {
+			t.Fatalf("claim %d: err=%v ok=%v", i, err, ok)
+		}
+		if got.ID != w.id || got.Priority != w.prio {
+			t.Errorf("claim %d = id %s prio %d, want id %s prio %d", i, got.ID, got.Priority, w.id, w.prio)
+		}
+	}
+}
+
+func TestClaimFIFOWithinSamePriority(t *testing.T) {
+	b, _ := newTestBroker(t)
+	ctx := context.Background()
+
+	first := job.New("emails", []byte("first"))
+	first.Priority = 5
+	if err := b.Enqueue(ctx, first); err != nil {
+		t.Fatalf("Enqueue first: %v", err)
+	}
+	time.Sleep(2 * time.Millisecond)
+	second := job.New("emails", []byte("second"))
+	second.Priority = 5
+	if err := b.Enqueue(ctx, second); err != nil {
+		t.Fatalf("Enqueue second: %v", err)
+	}
+
+	got1, ok1, err1 := b.Claim(ctx, "emails", time.Minute)
+	if err1 != nil || !ok1 {
+		t.Fatalf("first Claim: err=%v ok=%v", err1, ok1)
+	}
+	got2, ok2, err2 := b.Claim(ctx, "emails", time.Minute)
+	if err2 != nil || !ok2 {
+		t.Fatalf("second Claim: err=%v ok=%v", err2, ok2)
+	}
+	if got1.ID != first.ID {
+		t.Errorf("first claim = %s, want oldest %s", got1.ID, first.ID)
+	}
+	if got2.ID != second.ID {
+		t.Errorf("second claim = %s, want %s", got2.ID, second.ID)
+	}
+}
+
+func TestWithPriorityZeroOverridesJobPriority(t *testing.T) {
+	b, rdb := newTestBroker(t)
+	ctx := context.Background()
+
+	j := job.New("emails", []byte("x"))
+	j.Priority = 7
+	if err := b.Enqueue(ctx, j, broker.WithPriority(0)); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if p, _ := rdb.HGet(ctx, "job:"+j.ID, "priority").Result(); p != "0" {
+		t.Errorf("priority = %q, want 0 (WithPriority(0) must override job.Priority=7)", p)
+	}
+}
+
 func TestConcurrentClaimsDeliverEachJobOnce(t *testing.T) {
 	b, _ := newTestBroker(t)
 	ctx := context.Background()
