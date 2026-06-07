@@ -20,6 +20,7 @@ func main() {
 	addr := flag.String("redis", "localhost:6379", "Redis address")
 	queue := flag.String("queue", "default", "queue to enqueue into")
 	count := flag.Int("count", 100, "number of jobs to enqueue")
+	delay := flag.Duration("delay", 0, "schedule jobs this far in the future (0 = immediate)")
 	flag.Parse()
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
@@ -37,7 +38,11 @@ func main() {
 	for i := range *count {
 		payload := fmt.Sprintf(`{"n":%d}`, i)
 		j := job.New(*queue, []byte(payload))
-		if err := b.Enqueue(ctx, j); err != nil {
+		var opts []broker.EnqueueOption
+		if *delay > 0 {
+			opts = append(opts, broker.WithDelay(*delay))
+		}
+		if err := b.Enqueue(ctx, j, opts...); err != nil {
 			logger.Error("enqueue failed", "i", i, "err", err)
 			os.Exit(1)
 		}
