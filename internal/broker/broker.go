@@ -83,7 +83,9 @@ func delayedKey(queue string) string { return "q:" + queue + ":delayed" }
 
 // enqueueConfig holds resolved enqueue options. A zero readyAt means "now".
 type enqueueConfig struct {
-	readyAt time.Time
+	readyAt     time.Time
+	priority    int
+	prioritySet bool
 }
 
 // EnqueueOption customises a single Enqueue call.
@@ -109,6 +111,16 @@ func WithReadyAt(t time.Time) EnqueueOption {
 	}
 }
 
+// WithPriority sets the job's claim priority for this enqueue (higher is more
+// urgent), overriding any value already on the job. It is clamped to
+// [0, MaxPriority].
+func WithPriority(p int) EnqueueOption {
+	return func(c *enqueueConfig) {
+		c.priority = p
+		c.prioritySet = true
+	}
+}
+
 // Enqueue makes a job available for workers to claim. With no option it goes
 // straight to the ready set; with a future ready-at it goes to the delayed set
 // for the promoter to release later. The job hash and the set membership are
@@ -118,16 +130,21 @@ func (b *Broker) Enqueue(ctx context.Context, j job.Job, opts ...EnqueueOption) 
 	for _, opt := range opts {
 		opt(&cfg)
 	}
+	if cfg.prioritySet {
+		j.Priority = cfg.priority
+	}
+	j.Priority = clampPriority(j.Priority)
+	now := time.Now()
 
 	pipe := b.rdb.TxPipeline()
-	if cfg.readyAt.After(time.Now()) {
+	if cfg.readyAt.After(now) {
 		j.State = job.StateDelayed
 		pipe.HSet(ctx, jobKey(j.ID), j.ToHash())
 		pipe.ZAdd(ctx, delayedKey(j.Queue), redis.Z{Score: float64(cfg.readyAt.UnixMilli()), Member: j.ID})
 	} else {
 		j.State = job.StateReady
 		pipe.HSet(ctx, jobKey(j.ID), j.ToHash())
-		pipe.ZAdd(ctx, readyKey(j.Queue), redis.Z{Score: 0, Member: j.ID})
+		pipe.ZAdd(ctx, readyKey(j.Queue), redis.Z{Score: readyScore(j.Priority, now.UnixMilli()), Member: j.ID})
 	}
 	if _, err := pipe.Exec(ctx); err != nil {
 		return fmt.Errorf("broker: enqueuing job %s: %w", j.ID, err)
@@ -219,7 +236,7 @@ const defaultPromoteBatch = 100
 func (b *Broker) Reap(ctx context.Context, queue string) (int, error) {
 	n, err := reaperScript.Run(ctx, b.rdb,
 		[]string{inflightKey(queue), readyKey(queue)},
-		time.Now().UnixMilli(), jobKeyPrefix, defaultReapBatch,
+		time.Now().UnixMilli(), jobKeyPrefix, defaultReapBatch, priorityScale,
 	).Int()
 	if err != nil {
 		return 0, fmt.Errorf("broker: reaping %q: %w", queue, err)
@@ -234,7 +251,7 @@ func (b *Broker) Reap(ctx context.Context, queue string) (int, error) {
 func (b *Broker) Promote(ctx context.Context, queue string) (int, error) {
 	n, err := promoteScript.Run(ctx, b.rdb,
 		[]string{delayedKey(queue), readyKey(queue)},
-		time.Now().UnixMilli(), jobKeyPrefix, defaultPromoteBatch,
+		time.Now().UnixMilli(), jobKeyPrefix, defaultPromoteBatch, priorityScale,
 	).Int()
 	if err != nil {
 		return 0, fmt.Errorf("broker: promoting %q: %w", queue, err)

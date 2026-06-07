@@ -21,6 +21,7 @@ func main() {
 	queue := flag.String("queue", "default", "queue to enqueue into")
 	count := flag.Int("count", 100, "number of jobs to enqueue")
 	delay := flag.Duration("delay", 0, "schedule jobs this far in the future (0 = immediate)")
+	priority := flag.Int("priority", 0, "priority for enqueued jobs (higher is more urgent, 0-255)")
 	flag.Parse()
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
@@ -41,6 +42,9 @@ func main() {
 		var opts []broker.EnqueueOption
 		if *delay > 0 {
 			opts = append(opts, broker.WithDelay(*delay))
+		}
+		if *priority != 0 {
+			opts = append(opts, broker.WithPriority(*priority))
 		}
 		if err := b.Enqueue(ctx, j, opts...); err != nil {
 			logger.Error("enqueue failed", "i", i, "err", err)

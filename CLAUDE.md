@@ -15,7 +15,7 @@ and retry backoff are built, tested against a real Redis under `-race`, and CI i
 <https://github.com/StrangeNoob/relay>. What exists today:
 
 - `internal/job` — the `Job` model + Redis-hash encoding (`ToHash`/`FromHash`).
-- `internal/broker` — `Enqueue` (with `WithDelay`/`WithReadyAt` options), atomic `Claim`, `Ack`,
+- `internal/broker` — `Enqueue` (with `WithDelay`/`WithReadyAt`/`WithPriority` options), atomic `Claim`, `Ack`,
   `Nack` (full-jitter backoff via the delayed set), `Reap`, `Promote`, `Extend` (heartbeat), with
   Lua under `internal/broker/scripts/`: `claim.lua`, `ack.lua`, `nack.lua`, `reaper.lua`,
   `promote.lua`, `heartbeat.lua`.
@@ -71,7 +71,7 @@ and the whole engine follows:
 | Key | Type | Score = | Role |
 |---|---|---|---|
 | `job:{id}` | hash | — | full job. Fields: `id, queue, payload, state, attempts, max_retries, created_at, idempotency_key`. **No deadline field** — the deadline lives only as the `inflight` ZSET score. |
-| `q:{name}:ready` | ZSET | priority | claimable now; claim pops the best score (currently score 0 for all — priority is Phase 2) |
+| `q:{name}:ready` | ZSET | priority | claimable now; claim pops the best score = priority (higher first), oldest-first within a priority |
 | `q:{name}:inflight` | ZSET | visibility deadline | claimed-not-acked; **reaper scans this for expiry** |
 | `q:{name}:dlq` | list | — | exhausted jobs (inspect/requeue surface is Phase 3) |
 | `q:{name}:delayed` | ZSET | ready-at ts | scheduled + backoff jobs; **promoter scans this** and moves due ones (`ready-at ≤ now`) to `ready` |
@@ -118,7 +118,7 @@ Use `internal/` for everything not meant as a public import surface. `cmd/` hold
 ## Build order (do not jump ahead)
 
 1. **Phase 1 — core: ✅ done.** job model; enqueue/claim/ack/nack Lua; reaper; worker runtime; basic DLQ; integration tests; CI. A working, testable queue ships first.
-2. **Phase 2 — depth (in progress):** delayed jobs + promoter ✅; backoff + jitter ✅; priority, idempotency enforcement, per-queue rate limiting, Prometheus metrics still to do.
+2. **Phase 2 — depth (in progress):** delayed jobs + promoter ✅; backoff + jitter ✅; priority ✅; idempotency enforcement, per-queue rate limiting, Prometheus metrics still to do.
 3. **Phase 3 — polish:** dashboard; docker-compose demo; deployed demo; README + diagram.
 4. **Future work (NOT now):** Postgres-backed (`SKIP LOCKED`) mode; exactly-once via consumer outbox.
 
