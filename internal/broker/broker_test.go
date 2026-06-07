@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1022,5 +1023,41 @@ func TestDedupIsolatedPerQueue(t *testing.T) {
 	}
 	if n, _ := rdb.ZCard(ctx, "q:sms:ready").Result(); n != 1 {
 		t.Errorf("sms ready = %d, want 1", n)
+	}
+}
+
+func TestConcurrentEnqueueSameKeyDeduplicates(t *testing.T) {
+	b, rdb := newTestBroker(t)
+	ctx := context.Background()
+
+	const n = 50
+	var okCount, dupCount int64
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			j := job.New("emails", []byte("x"))
+			j.IdempotencyKey = "same"
+			switch err := b.Enqueue(ctx, j); {
+			case err == nil:
+				atomic.AddInt64(&okCount, 1)
+			case errors.Is(err, broker.ErrDuplicate):
+				atomic.AddInt64(&dupCount, 1)
+			default:
+				t.Errorf("unexpected error: %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+
+	if okCount != 1 {
+		t.Errorf("ok count = %d, want exactly 1", okCount)
+	}
+	if dupCount != int64(n-1) {
+		t.Errorf("dup count = %d, want %d", dupCount, n-1)
+	}
+	if c, _ := rdb.ZCard(ctx, "q:emails:ready").Result(); c != 1 {
+		t.Errorf("ready size = %d, want exactly 1", c)
 	}
 }
