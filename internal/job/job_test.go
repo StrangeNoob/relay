@@ -48,6 +48,7 @@ func TestNewUsesDefaultMaxRetries(t *testing.T) {
 func TestHashRoundTrip(t *testing.T) {
 	want := job.New("emails", []byte(`{"to":"a@b.com"}`))
 	want.Attempts = 2
+	want.Priority = 4
 	want.IdempotencyKey = "user-42-welcome"
 
 	got, err := job.FromHash(want.ToHash())
@@ -73,11 +74,42 @@ func TestHashRoundTrip(t *testing.T) {
 	if got.MaxRetries != want.MaxRetries {
 		t.Errorf("MaxRetries = %d, want %d", got.MaxRetries, want.MaxRetries)
 	}
+	if got.Priority != want.Priority {
+		t.Errorf("Priority = %d, want %d", got.Priority, want.Priority)
+	}
 	if got.IdempotencyKey != want.IdempotencyKey {
 		t.Errorf("IdempotencyKey = %q, want %q", got.IdempotencyKey, want.IdempotencyKey)
 	}
 	if !got.CreatedAt.Equal(want.CreatedAt) {
 		t.Errorf("CreatedAt = %v, want %v", got.CreatedAt, want.CreatedAt)
+	}
+}
+
+func TestNewDefaultsPriorityZero(t *testing.T) {
+	j := job.New("emails", []byte("x"))
+	if j.Priority != 0 {
+		t.Errorf("Priority = %d, want 0", j.Priority)
+	}
+}
+
+func TestPriorityRoundTrip(t *testing.T) {
+	want := job.New("emails", []byte("x"))
+	want.Priority = 7
+
+	got, err := job.FromHash(want.ToHash())
+	if err != nil {
+		t.Fatalf("FromHash: %v", err)
+	}
+	if got.Priority != 7 {
+		t.Errorf("Priority = %d, want 7", got.Priority)
+	}
+}
+
+func TestFromHashRejectsMalformedPriority(t *testing.T) {
+	h := job.New("emails", []byte("x")).ToHash()
+	h["priority"] = "not-a-number"
+	if _, err := job.FromHash(h); err == nil {
+		t.Error("FromHash with malformed priority = nil error, want error")
 	}
 }
 

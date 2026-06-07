@@ -52,6 +52,7 @@ type Job struct {
 	State      State     // current lifecycle position
 	Attempts   int       // number of delivery attempts so far (bumped on claim)
 	MaxRetries int       // attempts allowed before the job is dead-lettered
+	Priority   int       // claim order; higher is more urgent
 	CreatedAt  time.Time // wall-clock time the job was constructed
 
 	// IdempotencyKey, when set by the producer, lets the broker drop duplicate
@@ -70,6 +71,7 @@ func New(queue string, payload []byte) Job {
 		State:      StatePending,
 		Attempts:   0,
 		MaxRetries: DefaultMaxRetries,
+		Priority:   0,
 		CreatedAt:  time.Now(),
 	}
 }
@@ -84,6 +86,7 @@ const (
 	fieldState       = "state"
 	fieldAttempts    = "attempts"
 	fieldMaxRetries  = "max_retries"
+	fieldPriority    = "priority"
 	fieldCreatedAt   = "created_at"
 	fieldIdempotency = "idempotency_key"
 )
@@ -99,6 +102,7 @@ func (j Job) ToHash() map[string]string {
 		fieldState:       string(j.State),
 		fieldAttempts:    strconv.Itoa(j.Attempts),
 		fieldMaxRetries:  strconv.Itoa(j.MaxRetries),
+		fieldPriority:    strconv.Itoa(j.Priority),
 		fieldCreatedAt:   j.CreatedAt.Format(time.RFC3339Nano),
 		fieldIdempotency: j.IdempotencyKey,
 	}
@@ -120,6 +124,10 @@ func FromHash(h map[string]string) (Job, error) {
 	if err != nil {
 		return Job{}, fmt.Errorf("job: parsing %s %q: %w", fieldMaxRetries, h[fieldMaxRetries], err)
 	}
+	priority, err := strconv.Atoi(h[fieldPriority])
+	if err != nil {
+		return Job{}, fmt.Errorf("job: parsing %s %q: %w", fieldPriority, h[fieldPriority], err)
+	}
 	return Job{
 		ID:             h[fieldID],
 		Queue:          h[fieldQueue],
@@ -127,6 +135,7 @@ func FromHash(h map[string]string) (Job, error) {
 		State:          State(h[fieldState]),
 		Attempts:       attempts,
 		MaxRetries:     maxRetries,
+		Priority:       priority,
 		CreatedAt:      createdAt,
 		IdempotencyKey: h[fieldIdempotency],
 	}, nil
