@@ -25,6 +25,7 @@ type Broker struct {
 	rdb         *redis.Client
 	backoffBase time.Duration
 	backoffMax  time.Duration
+	dedupTTL    time.Duration
 
 	rndMu sync.Mutex
 	rnd   *rand.Rand
@@ -50,6 +51,7 @@ func New(rdb *redis.Client, opts ...Option) *Broker {
 		rdb:         rdb,
 		backoffBase: time.Second,
 		backoffMax:  10 * time.Minute,
+		dedupTTL:    24 * time.Hour,
 		rnd:         rand.New(rand.NewSource(time.Now().UnixNano())),
 	}
 	for _, opt := range opts {
