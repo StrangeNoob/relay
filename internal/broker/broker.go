@@ -25,6 +25,7 @@ type Broker struct {
 	rdb         *redis.Client
 	backoffBase time.Duration
 	backoffMax  time.Duration
+	dedupTTL    time.Duration
 
 	rndMu sync.Mutex
 	rnd   *rand.Rand
@@ -50,6 +51,7 @@ func New(rdb *redis.Client, opts ...Option) *Broker {
 		rdb:         rdb,
 		backoffBase: time.Second,
 		backoffMax:  10 * time.Minute,
+		dedupTTL:    24 * time.Hour,
 		rnd:         rand.New(rand.NewSource(time.Now().UnixNano())),
 	}
 	for _, opt := range opts {
@@ -83,9 +85,11 @@ func delayedKey(queue string) string { return "q:" + queue + ":delayed" }
 
 // enqueueConfig holds resolved enqueue options. A zero readyAt means "now".
 type enqueueConfig struct {
-	readyAt     time.Time
-	priority    int
-	prioritySet bool
+	readyAt           time.Time
+	priority          int
+	prioritySet       bool
+	idempotencyKey    string
+	idempotencyKeySet bool
 }
 
 // EnqueueOption customises a single Enqueue call.
@@ -121,10 +125,25 @@ func WithPriority(p int) EnqueueOption {
 	}
 }
 
+// WithIdempotencyKey sets the job's idempotency key for this enqueue, overriding
+// any value already on the job. A non-empty key makes the enqueue dedup: a second
+// enqueue with the same key on the same queue, within the dedup TTL, is dropped
+// with ErrDuplicate. Passing "" clears any key already on the job and disables
+// dedup for this call.
+func WithIdempotencyKey(k string) EnqueueOption {
+	return func(c *enqueueConfig) {
+		c.idempotencyKey = k
+		c.idempotencyKeySet = true
+	}
+}
+
 // Enqueue makes a job available for workers to claim. With no option it goes
 // straight to the ready set; with a future ready-at it goes to the delayed set
 // for the promoter to release later. The job hash and the set membership are
-// written in one transaction so a crash can never leave one without the other.
+// written in one atomic Lua script so a crash can never leave one without the
+// other. When an idempotency key is present, the dedup gate (SET NX) is also
+// inside the same script, so claiming the key and writing the job are atomic
+// with no crash window between them.
 func (b *Broker) Enqueue(ctx context.Context, j job.Job, opts ...EnqueueOption) error {
 	var cfg enqueueConfig
 	for _, opt := range opts {
@@ -134,20 +153,50 @@ func (b *Broker) Enqueue(ctx context.Context, j job.Job, opts ...EnqueueOption) 
 		j.Priority = cfg.priority
 	}
 	j.Priority = clampPriority(j.Priority)
-	now := time.Now()
+	if cfg.idempotencyKeySet {
+		j.IdempotencyKey = cfg.idempotencyKey
+	}
 
-	pipe := b.rdb.TxPipeline()
+	now := time.Now()
+	var targetKey string
+	var score float64
 	if cfg.readyAt.After(now) {
 		j.State = job.StateDelayed
-		pipe.HSet(ctx, jobKey(j.ID), j.ToHash())
-		pipe.ZAdd(ctx, delayedKey(j.Queue), redis.Z{Score: float64(cfg.readyAt.UnixMilli()), Member: j.ID})
+		targetKey = delayedKey(j.Queue)
+		score = float64(cfg.readyAt.UnixMilli())
 	} else {
 		j.State = job.StateReady
-		pipe.HSet(ctx, jobKey(j.ID), j.ToHash())
-		pipe.ZAdd(ctx, readyKey(j.Queue), redis.Z{Score: readyScore(j.Priority, now.UnixMilli()), Member: j.ID})
+		targetKey = readyKey(j.Queue)
+		score = readyScore(j.Priority, now.UnixMilli())
 	}
-	if _, err := pipe.Exec(ctx); err != nil {
+
+	// Dedup only when the job carries an idempotency key. TTL is clamped to at
+	// least 1s because Redis SET EX rejects a non-positive expiry.
+	useDedup := "0"
+	ttlSecs := 0
+	dk := ""
+	if j.IdempotencyKey != "" {
+		useDedup = "1"
+		dk = dedupKey(j.Queue, j.IdempotencyKey)
+		ttlSecs = int(b.dedupTTL.Seconds())
+		if ttlSecs < 1 {
+			ttlSecs = 1
+		}
+	}
+
+	h := j.ToHash()
+	args := make([]any, 0, 4+2*len(h))
+	args = append(args, j.ID, score, ttlSecs, useDedup)
+	for k, v := range h {
+		args = append(args, k, v)
+	}
+
+	res, err := enqueueScript.Run(ctx, b.rdb, []string{jobKey(j.ID), targetKey, dk}, args...).Text()
+	if err != nil {
 		return fmt.Errorf("broker: enqueuing job %s: %w", j.ID, err)
+	}
+	if res == "dup" {
+		return ErrDuplicate
 	}
 	return nil
 }

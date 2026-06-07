@@ -2,8 +2,10 @@ package broker_test
 
 import (
 	"context"
+	"errors"
 	"os"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -852,5 +854,210 @@ func TestConcurrentClaimsDeliverEachJobOnce(t *testing.T) {
 		if !enqueued[id] {
 			t.Errorf("claimed an unknown job %s", id)
 		}
+	}
+}
+
+func TestEnqueueWithIdempotencyKeyCreatesMarker(t *testing.T) {
+	b, rdb := newTestBroker(t)
+	ctx := context.Background()
+
+	j := job.New("emails", []byte("x"))
+	if err := b.Enqueue(ctx, j, broker.WithIdempotencyKey("k1")); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	val, err := rdb.Get(ctx, "q:emails:dedup:k1").Result()
+	if err != nil {
+		t.Fatalf("dedup marker missing: %v", err)
+	}
+	if val != j.ID {
+		t.Errorf("marker value = %q, want job id %q", val, j.ID)
+	}
+	ttl, _ := rdb.TTL(ctx, "q:emails:dedup:k1").Result()
+	if ttl <= 0 || ttl > 24*time.Hour {
+		t.Errorf("marker TTL = %v, want within (0, 24h]", ttl)
+	}
+	if n, _ := rdb.ZCard(ctx, "q:emails:ready").Result(); n != 1 {
+		t.Errorf("ready size = %d, want 1", n)
+	}
+}
+
+func TestEnqueueDuplicateKeyReturnsErrDuplicate(t *testing.T) {
+	b, rdb := newTestBroker(t)
+	ctx := context.Background()
+
+	first := job.New("emails", []byte("first"))
+	if err := b.Enqueue(ctx, first, broker.WithIdempotencyKey("k1")); err != nil {
+		t.Fatalf("first Enqueue: %v", err)
+	}
+	second := job.New("emails", []byte("second"))
+	err := b.Enqueue(ctx, second, broker.WithIdempotencyKey("k1"))
+	if !errors.Is(err, broker.ErrDuplicate) {
+		t.Fatalf("second Enqueue err = %v, want ErrDuplicate", err)
+	}
+
+	if n, _ := rdb.ZCard(ctx, "q:emails:ready").Result(); n != 1 {
+		t.Errorf("ready size = %d, want 1 (duplicate dropped)", n)
+	}
+	if n, _ := rdb.Exists(ctx, "job:"+second.ID).Result(); n != 0 {
+		t.Errorf("duplicate job hash exists; the gate must precede the write")
+	}
+}
+
+func TestEnqueueDifferentKeysBothEnqueued(t *testing.T) {
+	b, rdb := newTestBroker(t)
+	ctx := context.Background()
+
+	if err := b.Enqueue(ctx, job.New("emails", []byte("a")), broker.WithIdempotencyKey("k1")); err != nil {
+		t.Fatalf("Enqueue k1: %v", err)
+	}
+	if err := b.Enqueue(ctx, job.New("emails", []byte("b")), broker.WithIdempotencyKey("k2")); err != nil {
+		t.Fatalf("Enqueue k2: %v", err)
+	}
+	if n, _ := rdb.ZCard(ctx, "q:emails:ready").Result(); n != 2 {
+		t.Errorf("ready size = %d, want 2", n)
+	}
+}
+
+func TestEnqueueReenqueueAfterMarkerExpiry(t *testing.T) {
+	b, rdb := newTestBroker(t)
+	ctx := context.Background()
+
+	first := job.New("emails", []byte("first"))
+	if err := b.Enqueue(ctx, first, broker.WithIdempotencyKey("k1")); err != nil {
+		t.Fatalf("first Enqueue: %v", err)
+	}
+	if err := rdb.Del(ctx, "q:emails:dedup:k1").Err(); err != nil {
+		t.Fatalf("Del: %v", err)
+	}
+	second := job.New("emails", []byte("second"))
+	if err := b.Enqueue(ctx, second, broker.WithIdempotencyKey("k1")); err != nil {
+		t.Fatalf("re-enqueue after expiry: %v", err)
+	}
+	if n, _ := rdb.ZCard(ctx, "q:emails:ready").Result(); n != 2 {
+		t.Errorf("ready size = %d, want 2 (re-enqueue allowed)", n)
+	}
+}
+
+func TestEnqueueKeylessCreatesNoMarker(t *testing.T) {
+	b, rdb := newTestBroker(t)
+	ctx := context.Background()
+
+	if err := b.Enqueue(ctx, job.New("emails", []byte("x"))); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	keys, _ := rdb.Keys(ctx, "q:emails:dedup:*").Result()
+	if len(keys) != 0 {
+		t.Errorf("dedup keys = %v, want none for a keyless enqueue", keys)
+	}
+}
+
+func TestEnqueueDelayedRespectsDedup(t *testing.T) {
+	b, rdb := newTestBroker(t)
+	ctx := context.Background()
+
+	first := job.New("emails", []byte("first"))
+	if err := b.Enqueue(ctx, first, broker.WithDelay(time.Hour), broker.WithIdempotencyKey("k1")); err != nil {
+		t.Fatalf("first Enqueue: %v", err)
+	}
+	if n, _ := rdb.ZCard(ctx, "q:emails:delayed").Result(); n != 1 {
+		t.Errorf("delayed size = %d, want 1", n)
+	}
+	if n, _ := rdb.Exists(ctx, "q:emails:dedup:k1").Result(); n != 1 {
+		t.Errorf("dedup marker missing for delayed enqueue")
+	}
+	second := job.New("emails", []byte("second"))
+	if err := b.Enqueue(ctx, second, broker.WithDelay(time.Hour), broker.WithIdempotencyKey("k1")); !errors.Is(err, broker.ErrDuplicate) {
+		t.Fatalf("second Enqueue err = %v, want ErrDuplicate", err)
+	}
+	if n, _ := rdb.ZCard(ctx, "q:emails:delayed").Result(); n != 1 {
+		t.Errorf("delayed size = %d, want 1 after dup", n)
+	}
+}
+
+func TestWithDedupTTLRespected(t *testing.T) {
+	_, rdb := newTestBroker(t)
+	ctx := context.Background()
+	b := broker.New(rdb, broker.WithDedupTTL(time.Hour))
+
+	j := job.New("emails", []byte("x"))
+	if err := b.Enqueue(ctx, j, broker.WithIdempotencyKey("k1")); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	ttl, _ := rdb.TTL(ctx, "q:emails:dedup:k1").Result()
+	if ttl <= 55*time.Minute || ttl > time.Hour {
+		t.Errorf("marker TTL = %v, want ~1h", ttl)
+	}
+}
+
+func TestWithIdempotencyKeyOverridesJobKey(t *testing.T) {
+	b, rdb := newTestBroker(t)
+	ctx := context.Background()
+
+	j := job.New("emails", []byte("x"))
+	j.IdempotencyKey = "preset"
+	if err := b.Enqueue(ctx, j, broker.WithIdempotencyKey("override")); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if n, _ := rdb.Exists(ctx, "q:emails:dedup:override").Result(); n != 1 {
+		t.Errorf("marker q:emails:dedup:override missing; override not applied")
+	}
+	if n, _ := rdb.Exists(ctx, "q:emails:dedup:preset").Result(); n != 0 {
+		t.Errorf("marker q:emails:dedup:preset exists; preset key was not overridden")
+	}
+}
+
+func TestDedupIsolatedPerQueue(t *testing.T) {
+	b, rdb := newTestBroker(t)
+	ctx := context.Background()
+
+	if err := b.Enqueue(ctx, job.New("emails", []byte("a")), broker.WithIdempotencyKey("k1")); err != nil {
+		t.Fatalf("Enqueue emails: %v", err)
+	}
+	// Same key on a different queue must NOT be treated as a duplicate.
+	if err := b.Enqueue(ctx, job.New("sms", []byte("b")), broker.WithIdempotencyKey("k1")); err != nil {
+		t.Fatalf("Enqueue sms: %v", err)
+	}
+	if n, _ := rdb.ZCard(ctx, "q:emails:ready").Result(); n != 1 {
+		t.Errorf("emails ready = %d, want 1", n)
+	}
+	if n, _ := rdb.ZCard(ctx, "q:sms:ready").Result(); n != 1 {
+		t.Errorf("sms ready = %d, want 1", n)
+	}
+}
+
+func TestConcurrentEnqueueSameKeyDeduplicates(t *testing.T) {
+	b, rdb := newTestBroker(t)
+	ctx := context.Background()
+
+	const n = 50
+	var okCount, dupCount int64
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			j := job.New("emails", []byte("x"))
+			j.IdempotencyKey = "same"
+			switch err := b.Enqueue(ctx, j); {
+			case err == nil:
+				atomic.AddInt64(&okCount, 1)
+			case errors.Is(err, broker.ErrDuplicate):
+				atomic.AddInt64(&dupCount, 1)
+			default:
+				t.Errorf("unexpected error: %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+
+	if okCount != 1 {
+		t.Errorf("ok count = %d, want exactly 1", okCount)
+	}
+	if dupCount != int64(n-1) {
+		t.Errorf("dup count = %d, want %d", dupCount, n-1)
+	}
+	if c, _ := rdb.ZCard(ctx, "q:emails:ready").Result(); c != 1 {
+		t.Errorf("ready size = %d, want exactly 1", c)
 	}
 }

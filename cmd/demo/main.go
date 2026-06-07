@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -22,6 +23,7 @@ func main() {
 	count := flag.Int("count", 100, "number of jobs to enqueue")
 	delay := flag.Duration("delay", 0, "schedule jobs this far in the future (0 = immediate)")
 	priority := flag.Int("priority", 0, "priority for enqueued jobs (higher is more urgent, 0-255)")
+	idempotencyKey := flag.String("idempotency-key", "", "idempotency key applied to every enqueued job (empty = none)")
 	flag.Parse()
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
@@ -46,7 +48,13 @@ func main() {
 		if *priority != 0 {
 			opts = append(opts, broker.WithPriority(*priority))
 		}
-		if err := b.Enqueue(ctx, j, opts...); err != nil {
+		if *idempotencyKey != "" {
+			opts = append(opts, broker.WithIdempotencyKey(*idempotencyKey))
+		}
+		switch err := b.Enqueue(ctx, j, opts...); {
+		case errors.Is(err, broker.ErrDuplicate):
+			logger.Info("duplicate dropped", "i", i, "key", *idempotencyKey)
+		case err != nil:
 			logger.Error("enqueue failed", "i", i, "err", err)
 			os.Exit(1)
 		}
