@@ -26,6 +26,7 @@ type Broker struct {
 	backoffBase time.Duration
 	backoffMax  time.Duration
 	dedupTTL    time.Duration
+	rateLimits  map[string]rateLimit
 
 	rndMu sync.Mutex
 	rnd   *rand.Rand
