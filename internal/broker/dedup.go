@@ -14,6 +14,8 @@ var ErrDuplicate = errors.New("broker: duplicate enqueue")
 // dedupKey is the Redis key holding the idempotency marker for one key on one
 // queue: `q:{name}:dedup:{key}`. It is a string with an EX TTL — Redis sets lack
 // per-member expiry, so each marker is its own key and expires independently.
+// The marker's value is the winning job's id — useful for observability (which
+// job owns the slot); the broker does not read it back.
 func dedupKey(queue, key string) string {
 	return "q:" + queue + ":dedup:" + key
 }
