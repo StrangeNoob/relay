@@ -17,8 +17,8 @@ and retry backoff are built, tested against a real Redis under `-race`, and CI i
 - `internal/job` — the `Job` model + Redis-hash encoding (`ToHash`/`FromHash`).
 - `internal/broker` — `Enqueue` (with `WithDelay`/`WithReadyAt`/`WithPriority`/`WithIdempotencyKey` options), atomic `Claim`, `Ack`,
   `Nack` (full-jitter backoff via the delayed set), `Reap`, `Promote`, `Extend` (heartbeat), with
-  Lua under `internal/broker/scripts/`: `claim.lua`, `ack.lua`, `nack.lua`, `reaper.lua`,
-  `promote.lua`, `heartbeat.lua`.
+  Lua under `internal/broker/scripts/`: `enqueue.lua`, `claim.lua`, `ack.lua`, `nack.lua`,
+  `reaper.lua`, `promote.lua`, `heartbeat.lua`.
 - `internal/worker` — `Worker` (claim loop, dispatch, heartbeat, graceful shutdown), plus `Reaper`
   and `Promoter` background loops sharing one `runDrainLoop` helper.
 - `cmd/worker`, `cmd/demo` — thin runnable entrypoints (worker pool + reaper + promoter; load
@@ -105,7 +105,7 @@ cmd/demo/main.go                   # ✅ load generator (--delay)
 cmd/server/main.go                 # ◻ API+dashboard server (Phase 3)
 internal/job/                      # ✅ job model + hash encoding
 internal/broker/                   # ✅ enqueue/claim/ack/nack/reap/promote/extend
-internal/broker/scripts/*.lua      # ✅ claim, ack, nack, reaper, promote, heartbeat (go:embed)
+internal/broker/scripts/*.lua      # ✅ enqueue, claim, ack, nack, reaper, promote, heartbeat (go:embed)
 internal/worker/                   # ✅ Worker + Reaper + Promoter runtime
 internal/{client,api,metrics}/     # ◻ producer SDK / HTTP API / Prometheus (Phase 2–3)
 web/                               # ◻ embedded dashboard assets (Phase 3)
