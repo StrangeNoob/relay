@@ -168,6 +168,11 @@ func (b *Broker) Nack(ctx context.Context, j job.Job) error {
 // in a loop until it returns 0 to drain everything.
 const defaultReapBatch = 100
 
+// defaultPromoteBatch bounds how many jobs a single Promote pass releases, so
+// one call cannot block Redis scanning a huge delayed backlog. Callers loop
+// until it returns 0 to drain everything due.
+const defaultPromoteBatch = 100
+
 // Reap requeues jobs whose visibility deadline has passed: workers that claimed
 // them have crashed or stalled without acking. Each expired job is moved from
 // inflight back to ready (atomically, in reaper.lua), which is what makes
@@ -181,6 +186,21 @@ func (b *Broker) Reap(ctx context.Context, queue string) (int, error) {
 	).Int()
 	if err != nil {
 		return 0, fmt.Errorf("broker: reaping %q: %w", queue, err)
+	}
+	return n, nil
+}
+
+// Promote releases delayed jobs whose ready-at time has passed, moving them from
+// the delayed set back to ready (atomically, in promote.lua). It returns the
+// number promoted in this pass; a return of defaultPromoteBatch means more may
+// remain, so call again.
+func (b *Broker) Promote(ctx context.Context, queue string) (int, error) {
+	n, err := promoteScript.Run(ctx, b.rdb,
+		[]string{delayedKey(queue), readyKey(queue)},
+		time.Now().UnixMilli(), jobKeyPrefix, defaultPromoteBatch,
+	).Int()
+	if err != nil {
+		return 0, fmt.Errorf("broker: promoting %q: %w", queue, err)
 	}
 	return n, nil
 }

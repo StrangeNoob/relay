@@ -482,6 +482,72 @@ func TestReapEnablesRedeliveryAfterCrash(t *testing.T) {
 	}
 }
 
+func TestPromoteMovesDueJob(t *testing.T) {
+	b, rdb := newTestBroker(t)
+	ctx := context.Background()
+
+	j := job.New("emails", []byte("hello"))
+	if err := b.Enqueue(ctx, j, broker.WithDelay(time.Hour)); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	// Fast-forward: rewrite the ready-at score into the past so it is due now.
+	if err := rdb.ZAdd(ctx, "q:emails:delayed",
+		redis.Z{Score: float64(time.Now().Add(-time.Millisecond).UnixMilli()), Member: j.ID}).Err(); err != nil {
+		t.Fatalf("ZAdd: %v", err)
+	}
+
+	n, err := b.Promote(ctx, "emails")
+	if err != nil {
+		t.Fatalf("Promote: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("promoted %d jobs, want 1", n)
+	}
+	if c, _ := rdb.ZCard(ctx, "q:emails:delayed").Result(); c != 0 {
+		t.Errorf("delayed size = %d, want 0 after promote", c)
+	}
+	members, _ := rdb.ZRange(ctx, "q:emails:ready", 0, -1).Result()
+	if len(members) != 1 || members[0] != j.ID {
+		t.Errorf("ready set = %v, want promoted [%s]", members, j.ID)
+	}
+	state, _ := rdb.HGet(ctx, "job:"+j.ID, "state").Result()
+	if state != string(job.StateReady) {
+		t.Errorf("state = %q, want %q", state, job.StateReady)
+	}
+	attempts, _ := rdb.HGet(ctx, "job:"+j.ID, "attempts").Result()
+	if attempts != "0" {
+		t.Errorf("attempts = %q, want 0 (promotion must not count as a delivery)", attempts)
+	}
+	score, _ := rdb.ZScore(ctx, "q:emails:ready", j.ID).Result()
+	if score != 0 {
+		t.Errorf("ready score = %v, want 0", score)
+	}
+}
+
+func TestPromoteLeavesNotDueJobs(t *testing.T) {
+	b, rdb := newTestBroker(t)
+	ctx := context.Background()
+
+	j := job.New("emails", []byte("hello"))
+	if err := b.Enqueue(ctx, j, broker.WithDelay(time.Hour)); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	n, err := b.Promote(ctx, "emails")
+	if err != nil {
+		t.Fatalf("Promote: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("promoted %d jobs, want 0 (none due)", n)
+	}
+	if c, _ := rdb.ZCard(ctx, "q:emails:delayed").Result(); c != 1 {
+		t.Errorf("delayed size = %d, want 1 (still scheduled)", c)
+	}
+	if c, _ := rdb.ZCard(ctx, "q:emails:ready").Result(); c != 0 {
+		t.Errorf("ready size = %d, want 0 (must not promote early)", c)
+	}
+}
+
 // TestConcurrentClaimsDeliverEachJobOnce is the competing-consumer safety check:
 // many workers hammer one queue at once and every job must be claimed exactly
 // once. If the claim were not atomic (e.g. peek-then-remove as two round-trips),

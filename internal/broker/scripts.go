@@ -35,3 +35,8 @@ var reaperScript = redis.NewScript(reaperSrc)
 var heartbeatSrc string
 
 var heartbeatScript = redis.NewScript(heartbeatSrc)
+
+//go:embed scripts/promote.lua
+var promoteSrc string
+
+var promoteScript = redis.NewScript(promoteSrc)
