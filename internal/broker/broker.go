@@ -126,7 +126,9 @@ func WithPriority(p int) EnqueueOption {
 // Enqueue makes a job available for workers to claim. With no option it goes
 // straight to the ready set; with a future ready-at it goes to the delayed set
 // for the promoter to release later. The job hash and the set membership are
-// written in one transaction so a crash can never leave one without the other.
+// written in one atomic Lua script so a crash can never leave one without the
+// other, and the dedup gate added in the next task can slot in before the write
+// without an extra round-trip.
 func (b *Broker) Enqueue(ctx context.Context, j job.Job, opts ...EnqueueOption) error {
 	var cfg enqueueConfig
 	for _, opt := range opts {
@@ -136,19 +138,28 @@ func (b *Broker) Enqueue(ctx context.Context, j job.Job, opts ...EnqueueOption) 
 		j.Priority = cfg.priority
 	}
 	j.Priority = clampPriority(j.Priority)
-	now := time.Now()
 
-	pipe := b.rdb.TxPipeline()
+	now := time.Now()
+	var targetKey string
+	var score float64
 	if cfg.readyAt.After(now) {
 		j.State = job.StateDelayed
-		pipe.HSet(ctx, jobKey(j.ID), j.ToHash())
-		pipe.ZAdd(ctx, delayedKey(j.Queue), redis.Z{Score: float64(cfg.readyAt.UnixMilli()), Member: j.ID})
+		targetKey = delayedKey(j.Queue)
+		score = float64(cfg.readyAt.UnixMilli())
 	} else {
 		j.State = job.StateReady
-		pipe.HSet(ctx, jobKey(j.ID), j.ToHash())
-		pipe.ZAdd(ctx, readyKey(j.Queue), redis.Z{Score: readyScore(j.Priority, now.UnixMilli()), Member: j.ID})
+		targetKey = readyKey(j.Queue)
+		score = readyScore(j.Priority, now.UnixMilli())
 	}
-	if _, err := pipe.Exec(ctx); err != nil {
+
+	h := j.ToHash()
+	args := make([]any, 0, 2+2*len(h))
+	args = append(args, j.ID, score)
+	for k, v := range h {
+		args = append(args, k, v)
+	}
+
+	if err := enqueueScript.Run(ctx, b.rdb, []string{jobKey(j.ID), targetKey}, args...).Err(); err != nil {
 		return fmt.Errorf("broker: enqueuing job %s: %w", j.ID, err)
 	}
 	return nil

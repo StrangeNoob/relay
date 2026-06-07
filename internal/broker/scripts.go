@@ -40,3 +40,8 @@ var heartbeatScript = redis.NewScript(heartbeatSrc)
 var promoteSrc string
 
 var promoteScript = redis.NewScript(promoteSrc)
+
+//go:embed scripts/enqueue.lua
+var enqueueSrc string
+
+var enqueueScript = redis.NewScript(enqueueSrc)
