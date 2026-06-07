@@ -84,6 +84,85 @@ func TestEnqueueAddsToReady(t *testing.T) {
 	}
 }
 
+func TestEnqueuePlainSetsReadyState(t *testing.T) {
+	b, rdb := newTestBroker(t)
+	ctx := context.Background()
+
+	j := job.New("emails", []byte("hello"))
+	if err := b.Enqueue(ctx, j); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	state, _ := rdb.HGet(ctx, "job:"+j.ID, "state").Result()
+	if state != string(job.StateReady) {
+		t.Errorf("state = %q, want %q", state, job.StateReady)
+	}
+}
+
+func TestEnqueueWithDelayGoesToDelayed(t *testing.T) {
+	b, rdb := newTestBroker(t)
+	ctx := context.Background()
+
+	const delay = time.Minute
+	before := time.Now().UnixMilli()
+	j := job.New("emails", []byte("hello"))
+	if err := b.Enqueue(ctx, j, broker.WithDelay(delay)); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	after := time.Now().UnixMilli()
+
+	if n, _ := rdb.ZCard(ctx, "q:emails:ready").Result(); n != 0 {
+		t.Errorf("ready size = %d, want 0 (job is delayed)", n)
+	}
+	score, err := rdb.ZScore(ctx, "q:emails:delayed", j.ID).Result()
+	if err != nil {
+		t.Fatalf("job not in delayed set: %v", err)
+	}
+	lo, hi := float64(before+delay.Milliseconds()), float64(after+delay.Milliseconds())
+	if score < lo || score > hi {
+		t.Errorf("delayed score = %v, want within [%v, %v]", score, lo, hi)
+	}
+	state, _ := rdb.HGet(ctx, "job:"+j.ID, "state").Result()
+	if state != string(job.StateDelayed) {
+		t.Errorf("state = %q, want %q", state, job.StateDelayed)
+	}
+}
+
+func TestEnqueueWithPastReadyAtGoesToReady(t *testing.T) {
+	b, rdb := newTestBroker(t)
+	ctx := context.Background()
+
+	j := job.New("emails", []byte("hello"))
+	if err := b.Enqueue(ctx, j, broker.WithReadyAt(time.Now().Add(-time.Hour))); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	if n, _ := rdb.ZCard(ctx, "q:emails:delayed").Result(); n != 0 {
+		t.Errorf("delayed size = %d, want 0 (ready-at is in the past)", n)
+	}
+	members, _ := rdb.ZRange(ctx, "q:emails:ready", 0, -1).Result()
+	if len(members) != 1 || members[0] != j.ID {
+		t.Errorf("ready set = %v, want [%s]", members, j.ID)
+	}
+}
+
+func TestEnqueueWithZeroReadyAtGoesToReady(t *testing.T) {
+	b, rdb := newTestBroker(t)
+	ctx := context.Background()
+
+	j := job.New("emails", []byte("hello"))
+	if err := b.Enqueue(ctx, j, broker.WithReadyAt(time.Time{})); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	if n, _ := rdb.ZCard(ctx, "q:emails:delayed").Result(); n != 0 {
+		t.Errorf("delayed size = %d, want 0 (zero ready-at is immediate)", n)
+	}
+	if n, _ := rdb.ZCard(ctx, "q:emails:ready").Result(); n != 1 {
+		t.Errorf("ready size = %d, want 1", n)
+	}
+}
+
 func TestClaimReturnsEnqueuedJob(t *testing.T) {
 	b, _ := newTestBroker(t)
 	ctx := context.Background()

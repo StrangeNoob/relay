@@ -32,6 +32,9 @@ const (
 	// StateDead is a job that exhausted its retry budget and was moved to the
 	// dead-letter queue for inspection.
 	StateDead State = "dead"
+	// StateDelayed is a job waiting in the delayed set for its ready-at time —
+	// either scheduled with a delay or waiting out a backoff after a failure.
+	StateDelayed State = "delayed"
 )
 
 // DefaultMaxRetries is the retry budget a job gets when New is not told

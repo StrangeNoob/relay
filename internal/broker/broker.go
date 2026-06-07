@@ -46,16 +46,58 @@ func inflightKey(queue string) string { return "q:" + queue + ":inflight" }
 // jobs land once they exhaust their retry budget.
 func dlqKey(queue string) string { return "q:" + queue + ":dlq" }
 
-// Enqueue makes a job available for workers to claim: it persists the job hash
-// and adds the id to the queue's ready set. Both writes run in one transaction
-// so a crash can never leave a job hash with no ready entry, or vice versa.
-//
-// The ready-set score is the job's priority; until priorities are wired up every
-// job enqueues at score 0.
-func (b *Broker) Enqueue(ctx context.Context, j job.Job) error {
+// delayedKey is the Redis key for a queue's delayed set: `q:{name}:delayed`, a
+// ZSET scored by each job's ready-at time. The promoter scans it.
+func delayedKey(queue string) string { return "q:" + queue + ":delayed" }
+
+// enqueueConfig holds resolved enqueue options. A zero readyAt means "now".
+type enqueueConfig struct {
+	readyAt time.Time
+}
+
+// EnqueueOption customises a single Enqueue call.
+type EnqueueOption func(*enqueueConfig)
+
+// WithDelay schedules the job to become claimable after d from now. A d <= 0 is
+// equivalent to a plain enqueue.
+func WithDelay(d time.Duration) EnqueueOption {
+	return func(c *enqueueConfig) {
+		if d > 0 {
+			c.readyAt = time.Now().Add(d)
+		}
+	}
+}
+
+// WithReadyAt schedules the job to become claimable at t. A zero t, or a t at or
+// before now, is equivalent to a plain enqueue.
+func WithReadyAt(t time.Time) EnqueueOption {
+	return func(c *enqueueConfig) {
+		if !t.IsZero() {
+			c.readyAt = t
+		}
+	}
+}
+
+// Enqueue makes a job available for workers to claim. With no option it goes
+// straight to the ready set; with a future ready-at it goes to the delayed set
+// for the promoter to release later. The job hash and the set membership are
+// written in one transaction so a crash can never leave one without the other.
+func (b *Broker) Enqueue(ctx context.Context, j job.Job, opts ...EnqueueOption) error {
+	var cfg enqueueConfig
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+
 	pipe := b.rdb.TxPipeline()
-	pipe.HSet(ctx, jobKey(j.ID), j.ToHash())
-	pipe.ZAdd(ctx, readyKey(j.Queue), redis.Z{Score: 0, Member: j.ID})
+	if cfg.readyAt.After(time.Now()) {
+		j.State = job.StateDelayed
+		pipe.HSet(ctx, jobKey(j.ID), j.ToHash())
+		pipe.ZAdd(ctx, delayedKey(j.Queue), redis.Z{Score: float64(cfg.readyAt.UnixMilli()), Member: j.ID})
+	} else {
+		j.State = job.StateReady
+		pipe.HSet(ctx, jobKey(j.ID), j.ToHash())
+		pipe.ZAdd(ctx, readyKey(j.Queue), redis.Z{Score: 0, Member: j.ID})
+	}
 	if _, err := pipe.Exec(ctx); err != nil {
 		return fmt.Errorf("broker: enqueuing job %s: %w", j.ID, err)
 	}
