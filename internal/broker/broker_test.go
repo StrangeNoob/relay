@@ -84,6 +84,85 @@ func TestEnqueueAddsToReady(t *testing.T) {
 	}
 }
 
+func TestEnqueuePlainSetsReadyState(t *testing.T) {
+	b, rdb := newTestBroker(t)
+	ctx := context.Background()
+
+	j := job.New("emails", []byte("hello"))
+	if err := b.Enqueue(ctx, j); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	state, _ := rdb.HGet(ctx, "job:"+j.ID, "state").Result()
+	if state != string(job.StateReady) {
+		t.Errorf("state = %q, want %q", state, job.StateReady)
+	}
+}
+
+func TestEnqueueWithDelayGoesToDelayed(t *testing.T) {
+	b, rdb := newTestBroker(t)
+	ctx := context.Background()
+
+	const delay = time.Minute
+	before := time.Now().UnixMilli()
+	j := job.New("emails", []byte("hello"))
+	if err := b.Enqueue(ctx, j, broker.WithDelay(delay)); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	after := time.Now().UnixMilli()
+
+	if n, _ := rdb.ZCard(ctx, "q:emails:ready").Result(); n != 0 {
+		t.Errorf("ready size = %d, want 0 (job is delayed)", n)
+	}
+	score, err := rdb.ZScore(ctx, "q:emails:delayed", j.ID).Result()
+	if err != nil {
+		t.Fatalf("job not in delayed set: %v", err)
+	}
+	lo, hi := float64(before+delay.Milliseconds()), float64(after+delay.Milliseconds())
+	if score < lo || score > hi {
+		t.Errorf("delayed score = %v, want within [%v, %v]", score, lo, hi)
+	}
+	state, _ := rdb.HGet(ctx, "job:"+j.ID, "state").Result()
+	if state != string(job.StateDelayed) {
+		t.Errorf("state = %q, want %q", state, job.StateDelayed)
+	}
+}
+
+func TestEnqueueWithPastReadyAtGoesToReady(t *testing.T) {
+	b, rdb := newTestBroker(t)
+	ctx := context.Background()
+
+	j := job.New("emails", []byte("hello"))
+	if err := b.Enqueue(ctx, j, broker.WithReadyAt(time.Now().Add(-time.Hour))); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	if n, _ := rdb.ZCard(ctx, "q:emails:delayed").Result(); n != 0 {
+		t.Errorf("delayed size = %d, want 0 (ready-at is in the past)", n)
+	}
+	members, _ := rdb.ZRange(ctx, "q:emails:ready", 0, -1).Result()
+	if len(members) != 1 || members[0] != j.ID {
+		t.Errorf("ready set = %v, want [%s]", members, j.ID)
+	}
+}
+
+func TestEnqueueWithZeroReadyAtGoesToReady(t *testing.T) {
+	b, rdb := newTestBroker(t)
+	ctx := context.Background()
+
+	j := job.New("emails", []byte("hello"))
+	if err := b.Enqueue(ctx, j, broker.WithReadyAt(time.Time{})); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	if n, _ := rdb.ZCard(ctx, "q:emails:delayed").Result(); n != 0 {
+		t.Errorf("delayed size = %d, want 0 (zero ready-at is immediate)", n)
+	}
+	if n, _ := rdb.ZCard(ctx, "q:emails:ready").Result(); n != 1 {
+		t.Errorf("ready size = %d, want 1", n)
+	}
+}
+
 func TestClaimReturnsEnqueuedJob(t *testing.T) {
 	b, _ := newTestBroker(t)
 	ctx := context.Background()
@@ -217,15 +296,71 @@ func TestNackRequeuesWhenRetriesRemain(t *testing.T) {
 	if n, _ := rdb.ZCard(ctx, "q:emails:inflight").Result(); n != 0 {
 		t.Errorf("inflight size = %d, want 0 after nack", n)
 	}
+	if n, _ := rdb.ZCard(ctx, "q:emails:ready").Result(); n != 0 {
+		t.Errorf("ready size = %d, want 0 (retry waits in delayed)", n)
+	}
+	if n, _ := rdb.LLen(ctx, "q:emails:dlq").Result(); n != 0 {
+		t.Errorf("dlq size = %d, want 0 (retries remain)", n)
+	}
+	if n, _ := rdb.ZCard(ctx, "q:emails:delayed").Result(); n != 1 {
+		t.Errorf("delayed size = %d, want 1 (retry scheduled)", n)
+	}
+	state, _ := rdb.HGet(ctx, "job:"+claimed.ID, "state").Result()
+	if state != string(job.StateDelayed) {
+		t.Errorf("job state = %q, want %q", state, job.StateDelayed)
+	}
+}
 
-	members, _ := rdb.ZRange(ctx, "q:emails:ready", 0, -1).Result()
-	if len(members) != 1 || members[0] != claimed.ID {
-		t.Errorf("ready set = %v, want requeued [%s]", members, claimed.ID)
+func TestNackBackoffReadyAtWithinCeiling(t *testing.T) {
+	b, rdb := newTestBroker(t)
+	ctx := context.Background()
+
+	// Default backoff base is 1s; after one claim Attempts is 1, so the ceiling
+	// is 1s and the jittered ready-at lands within [now, now+1s).
+	claimed := claimOne(t, b, job.New("emails", []byte("hello")))
+	before := time.Now().UnixMilli()
+	if err := b.Nack(ctx, claimed); err != nil {
+		t.Fatalf("Nack: %v", err)
 	}
 
-	state, _ := rdb.HGet(ctx, "job:"+claimed.ID, "state").Result()
-	if state != string(job.StateReady) {
-		t.Errorf("job state = %q, want %q", state, job.StateReady)
+	score, err := rdb.ZScore(ctx, "q:emails:delayed", claimed.ID).Result()
+	if err != nil {
+		t.Fatalf("job not in delayed set: %v", err)
+	}
+	lo, hi := float64(before), float64(time.Now().Add(time.Second).UnixMilli())
+	if score < lo || score > hi {
+		t.Errorf("delayed ready-at = %v, want within [%v, %v]", score, lo, hi)
+	}
+}
+
+func TestNackThenPromoteRedelivers(t *testing.T) {
+	b, rdb := newTestBroker(t)
+	ctx := context.Background()
+
+	// Claim, fail, and nack -> the job waits in delayed under a backoff.
+	first := claimOne(t, b, job.New("emails", []byte("hello")))
+	if err := b.Nack(ctx, first); err != nil {
+		t.Fatalf("Nack: %v", err)
+	}
+	// Fast-forward the backoff so the retry is due now.
+	if err := rdb.ZAdd(ctx, "q:emails:delayed",
+		redis.Z{Score: float64(time.Now().Add(-time.Millisecond).UnixMilli()), Member: first.ID}).Err(); err != nil {
+		t.Fatalf("ZAdd: %v", err)
+	}
+	if n, err := b.Promote(ctx, "emails"); err != nil || n != 1 {
+		t.Fatalf("Promote: n=%d err=%v, want 1", n, err)
+	}
+
+	// A second claim re-delivers the same job with its attempt count advanced.
+	second, ok, err := b.Claim(ctx, "emails", time.Minute)
+	if err != nil || !ok {
+		t.Fatalf("re-Claim: err=%v ok=%v", err, ok)
+	}
+	if second.ID != first.ID {
+		t.Errorf("re-claimed %s, want the same job %s", second.ID, first.ID)
+	}
+	if second.Attempts != 2 {
+		t.Errorf("re-claim Attempts = %d, want 2", second.Attempts)
 	}
 }
 
@@ -251,6 +386,9 @@ func TestNackDeadLettersWhenExhausted(t *testing.T) {
 	}
 	if n, _ := rdb.ZCard(ctx, "q:emails:inflight").Result(); n != 0 {
 		t.Errorf("inflight size = %d, want 0", n)
+	}
+	if n, _ := rdb.ZCard(ctx, "q:emails:delayed").Result(); n != 0 {
+		t.Errorf("delayed size = %d, want 0 (exhausted job should be dead, not delayed)", n)
 	}
 
 	state, _ := rdb.HGet(ctx, "job:"+claimed.ID, "state").Result()
@@ -400,6 +538,72 @@ func TestReapEnablesRedeliveryAfterCrash(t *testing.T) {
 	}
 	if second.Attempts != 2 {
 		t.Errorf("re-claim Attempts = %d, want 2", second.Attempts)
+	}
+}
+
+func TestPromoteMovesDueJob(t *testing.T) {
+	b, rdb := newTestBroker(t)
+	ctx := context.Background()
+
+	j := job.New("emails", []byte("hello"))
+	if err := b.Enqueue(ctx, j, broker.WithDelay(time.Hour)); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	// Fast-forward: rewrite the ready-at score into the past so it is due now.
+	if err := rdb.ZAdd(ctx, "q:emails:delayed",
+		redis.Z{Score: float64(time.Now().Add(-time.Millisecond).UnixMilli()), Member: j.ID}).Err(); err != nil {
+		t.Fatalf("ZAdd: %v", err)
+	}
+
+	n, err := b.Promote(ctx, "emails")
+	if err != nil {
+		t.Fatalf("Promote: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("promoted %d jobs, want 1", n)
+	}
+	if c, _ := rdb.ZCard(ctx, "q:emails:delayed").Result(); c != 0 {
+		t.Errorf("delayed size = %d, want 0 after promote", c)
+	}
+	members, _ := rdb.ZRange(ctx, "q:emails:ready", 0, -1).Result()
+	if len(members) != 1 || members[0] != j.ID {
+		t.Errorf("ready set = %v, want promoted [%s]", members, j.ID)
+	}
+	state, _ := rdb.HGet(ctx, "job:"+j.ID, "state").Result()
+	if state != string(job.StateReady) {
+		t.Errorf("state = %q, want %q", state, job.StateReady)
+	}
+	attempts, _ := rdb.HGet(ctx, "job:"+j.ID, "attempts").Result()
+	if attempts != "0" {
+		t.Errorf("attempts = %q, want 0 (promotion must not count as a delivery)", attempts)
+	}
+	score, _ := rdb.ZScore(ctx, "q:emails:ready", j.ID).Result()
+	if score != 0 {
+		t.Errorf("ready score = %v, want 0", score)
+	}
+}
+
+func TestPromoteLeavesNotDueJobs(t *testing.T) {
+	b, rdb := newTestBroker(t)
+	ctx := context.Background()
+
+	j := job.New("emails", []byte("hello"))
+	if err := b.Enqueue(ctx, j, broker.WithDelay(time.Hour)); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	n, err := b.Promote(ctx, "emails")
+	if err != nil {
+		t.Fatalf("Promote: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("promoted %d jobs, want 0 (none due)", n)
+	}
+	if c, _ := rdb.ZCard(ctx, "q:emails:delayed").Result(); c != 1 {
+		t.Errorf("delayed size = %d, want 1 (still scheduled)", c)
+	}
+	if c, _ := rdb.ZCard(ctx, "q:emails:ready").Result(); c != 0 {
+		t.Errorf("ready size = %d, want 0 (must not promote early)", c)
 	}
 }
 

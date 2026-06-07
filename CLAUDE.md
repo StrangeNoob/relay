@@ -10,20 +10,23 @@ project: the point is to *prove understanding of queue internals*, not to wrap a
 library. Do not introduce a queue dependency (BullMQ, asynq, Machinery, Celery, etc.) — the
 mechanics are the deliverable.
 
-**Status: Phase 1 complete.** The core engine is built, tested against a real Redis under
-`-race`, and CI is green. Repo: <https://github.com/StrangeNoob/relay>. What exists today:
+**Status: Phase 1 complete; Phase 2a complete.** The core engine plus delayed jobs, the promoter,
+and retry backoff are built, tested against a real Redis under `-race`, and CI is green. Repo:
+<https://github.com/StrangeNoob/relay>. What exists today:
 
 - `internal/job` — the `Job` model + Redis-hash encoding (`ToHash`/`FromHash`).
-- `internal/broker` — `Enqueue`, atomic `Claim`, `Ack`, `Nack`, `Reap`, `Extend` (heartbeat),
-  with Lua under `internal/broker/scripts/`: `claim.lua`, `ack.lua`, `nack.lua`, `reaper.lua`,
-  `heartbeat.lua`.
-- `internal/worker` — `Worker` (claim loop, dispatch, heartbeat, graceful shutdown) and `Reaper`
-  (background reap loop).
-- `cmd/worker`, `cmd/demo` — thin runnable entrypoints (worker pool + reaper; load generator).
+- `internal/broker` — `Enqueue` (with `WithDelay`/`WithReadyAt` options), atomic `Claim`, `Ack`,
+  `Nack` (full-jitter backoff via the delayed set), `Reap`, `Promote`, `Extend` (heartbeat), with
+  Lua under `internal/broker/scripts/`: `claim.lua`, `ack.lua`, `nack.lua`, `reaper.lua`,
+  `promote.lua`, `heartbeat.lua`.
+- `internal/worker` — `Worker` (claim loop, dispatch, heartbeat, graceful shutdown), plus `Reaper`
+  and `Promoter` background loops sharing one `runDrainLoop` helper.
+- `cmd/worker`, `cmd/demo` — thin runnable entrypoints (worker pool + reaper + promoter; load
+  generator with `--delay`).
 - `.github/workflows/ci.yml` — Redis service + `go test -race` + `golangci-lint`.
 
-Phase 2 (delayed jobs/promoter, priority, backoff+jitter, idempotency enforcement, rate limiting,
-metrics) and Phase 3 (API/dashboard/`cmd/server`, docker-compose, deploy) are **not** built yet.
+Remaining Phase 2 (priority, idempotency enforcement, per-queue rate limiting, Prometheus metrics)
+and Phase 3 (API/dashboard/`cmd/server`, docker-compose, deploy) are **not** built yet.
 
 ## Source of truth
 
@@ -49,11 +52,15 @@ spec disagree, the spec wins until the spec is deliberately updated.
 
 ## Known limitations (intentional, documented)
 
-- **No fencing token on ack/nack.** `Ack`/`Nack`/reap act on a bare job id. If a worker stalls
-  past its visibility deadline, gets reaped and re-claimed elsewhere, the original worker's late
-  ack/nack can disturb the new claim. This is consistent with at-least-once delivery; per-claim
-  fencing tokens are possible future hardening, not a current guarantee.
-- **`nack` has no backoff yet** (requeues immediately to `ready`) — see lifecycle below.
+- **No fencing token on ack/nack/promote.** `Ack`/`Nack`/reap/promote act on a bare job id. If a
+  worker stalls past its visibility deadline, gets reaped and re-claimed elsewhere, the original
+  worker's late ack/nack can disturb the new claim; likewise a backoff retry trusts the `attempts`
+  recorded on the hash, so a reclaim race could miscount. Consistent with at-least-once delivery;
+  per-claim fencing tokens are possible future hardening, not a current guarantee.
+- **Backoff is full-jitter, computed in Go.** `Nack` computes the retry delay (`random(0,
+  min(cap, base·2^(n-1)))`) under a mutex-guarded rand and passes the ready-at into `nack.lua`;
+  the script only decides retry-vs-dead and moves the job. Defaults: base 1s, cap 10m
+  (`broker.WithBackoff`).
 
 ## Redis data model & job lifecycle (the architecture in brief)
 
@@ -67,37 +74,38 @@ and the whole engine follows:
 | `q:{name}:ready` | ZSET | priority | claimable now; claim pops the best score (currently score 0 for all — priority is Phase 2) |
 | `q:{name}:inflight` | ZSET | visibility deadline | claimed-not-acked; **reaper scans this for expiry** |
 | `q:{name}:dlq` | list | — | exhausted jobs (inspect/requeue surface is Phase 3) |
-| `q:{name}:delayed` | ZSET | ready-at ts | **planned (Phase 2)** — scheduled + backoff jobs; promoter moves due ones to `ready` |
+| `q:{name}:delayed` | ZSET | ready-at ts | scheduled + backoff jobs; **promoter scans this** and moves due ones (`ready-at ≤ now`) to `ready` |
 | `q:{name}:dedup` | set/hash | — | **planned (Phase 2)** — idempotency keys for enqueue dedup |
 
-States in use today: `pending` (constructed, not enqueued), `ready`, `inflight`, `dead`. The
-`delayed` state arrives with Phase 2.
+States in use today: `pending` (constructed, not enqueued), `ready`, `inflight`, `delayed`
+(scheduled or waiting out a backoff), `dead`.
 
 Lifecycle (each arrow that must stay atomic is a Lua script — see invariants):
 
 ```
-enqueue → ready → [CLAIM: ready→inflight, deadline=now+vt, attempts++] → process
+enqueue            → ready
+enqueue(WithDelay) → delayed ──[promoter: ready-at≤now]──→ ready
+  → [CLAIM: ready→inflight, deadline=now+vt, attempts++] → process
   ack   → remove from inflight + delete job
-  nack  → attempts<maxRetries ? ready : dlq        # backoff via `delayed` is Phase 2
-  reaper (bg): inflight where deadline<=now → ready # at-least-once on crash
+  nack  → attempts<maxRetries ? delayed (now + full-jitter backoff) : dlq
+  reaper   (bg): inflight where deadline<=now → ready  # at-least-once on crash
+  promoter (bg): delayed  where ready-at<=now  → ready  # releases scheduled + backed-off jobs
 ```
 
-Current reality vs. spec target: `nack` requeues straight to `ready` with no delay — exponential
-backoff + jitter (re-queue via `delayed`) and the **promoter** loop are Phase 2. Today the only
-background loop is the reaper; together with the worker claim loop they are the only things that
+Two background loops (reaper, promoter) plus the worker claim loop are the only things that
 move jobs between states. Heartbeat (`broker.Extend`, `ZADD XX`) pushes a job's `inflight`
 deadline forward while a long handler runs, so the reaper does not reclaim live work.
 
 ## Layout (✅ built · ◻ planned)
 
 ```
-cmd/worker/main.go                 # ✅ worker pool + reaper daemon
-cmd/demo/main.go                   # ✅ load generator
+cmd/worker/main.go                 # ✅ worker pool + reaper + promoter daemon
+cmd/demo/main.go                   # ✅ load generator (--delay)
 cmd/server/main.go                 # ◻ API+dashboard server (Phase 3)
 internal/job/                      # ✅ job model + hash encoding
-internal/broker/                   # ✅ enqueue/claim/ack/nack/reap/extend  (◻ promoter — Phase 2)
-internal/broker/scripts/*.lua      # ✅ claim, ack, nack, reaper, heartbeat (embedded via go:embed)
-internal/worker/                   # ✅ Worker + Reaper runtime
+internal/broker/                   # ✅ enqueue/claim/ack/nack/reap/promote/extend
+internal/broker/scripts/*.lua      # ✅ claim, ack, nack, reaper, promote, heartbeat (go:embed)
+internal/worker/                   # ✅ Worker + Reaper + Promoter runtime
 internal/{client,api,metrics}/     # ◻ producer SDK / HTTP API / Prometheus (Phase 2–3)
 web/                               # ◻ embedded dashboard assets (Phase 3)
 deployments/docker-compose.yml     # ◻ redis + server + N workers + demo (Phase 3)
@@ -110,7 +118,7 @@ Use `internal/` for everything not meant as a public import surface. `cmd/` hold
 ## Build order (do not jump ahead)
 
 1. **Phase 1 — core: ✅ done.** job model; enqueue/claim/ack/nack Lua; reaper; worker runtime; basic DLQ; integration tests; CI. A working, testable queue ships first.
-2. **Phase 2 — depth (next):** delayed jobs + promoter; priority; backoff + jitter; idempotency; per-queue rate limiting; Prometheus metrics.
+2. **Phase 2 — depth (in progress):** delayed jobs + promoter ✅; backoff + jitter ✅; priority, idempotency enforcement, per-queue rate limiting, Prometheus metrics still to do.
 3. **Phase 3 — polish:** dashboard; docker-compose demo; deployed demo; README + diagram.
 4. **Future work (NOT now):** Postgres-backed (`SKIP LOCKED`) mode; exactly-once via consumer outbox.
 

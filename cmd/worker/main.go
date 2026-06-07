@@ -31,6 +31,9 @@ func main() {
 	concurrency := flag.Int("concurrency", 4, "number of concurrent workers")
 	failRate := flag.Float64("fail-rate", 0.1, "fraction of jobs the demo handler fails (0..1)")
 	reapInterval := flag.Duration("reap-interval", 5*time.Second, "how often the reaper scans for expired jobs")
+	promoteInterval := flag.Duration("promote-interval", time.Second, "how often the promoter releases due delayed jobs")
+	backoffBase := flag.Duration("backoff-base", time.Second, "retry backoff base delay")
+	backoffMax := flag.Duration("backoff-max", 10*time.Minute, "retry backoff ceiling")
 	flag.Parse()
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
@@ -49,7 +52,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	b := broker.New(rdb)
+	b := broker.New(rdb, broker.WithBackoff(*backoffBase, *backoffMax))
 	handler := demoHandler(*failRate, logger)
 
 	var wg sync.WaitGroup
@@ -70,6 +73,15 @@ func main() {
 		defer wg.Done()
 		if err := r.Run(ctx); err != nil {
 			logger.Error("reaper exited with error", "err", err)
+		}
+	}()
+
+	p := worker.NewPromoter(b, *queue, *promoteInterval)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if err := p.Run(ctx); err != nil {
+			logger.Error("promoter exited with error", "err", err)
 		}
 	}()
 

@@ -9,6 +9,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/rand"
+	"sync"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -17,14 +19,43 @@ import (
 )
 
 // Broker talks to a single Redis instance. It is safe for concurrent use: all
-// state lives in Redis, and the type itself holds only the client.
+// queue state lives in Redis, and the only mutable in-process state is the
+// jitter source, which is mutex-guarded.
 type Broker struct {
-	rdb *redis.Client
+	rdb         *redis.Client
+	backoffBase time.Duration
+	backoffMax  time.Duration
+
+	rndMu sync.Mutex
+	rnd   *rand.Rand
 }
 
-// New returns a Broker backed by the given Redis client.
-func New(rdb *redis.Client) *Broker {
-	return &Broker{rdb: rdb}
+// Option customises a Broker at construction.
+type Option func(*Broker)
+
+// WithBackoff sets the retry backoff base and ceiling. The nth retry waits a
+// full-jitter delay in [0, min(maxDelay, base*2^(n-1))); if base > maxDelay the
+// ceiling is always maxDelay.
+func WithBackoff(base, maxDelay time.Duration) Option {
+	return func(b *Broker) {
+		b.backoffBase = base
+		b.backoffMax = maxDelay
+	}
+}
+
+// New returns a Broker backed by the given Redis client. Defaults: backoff base
+// 1s, ceiling 10m.
+func New(rdb *redis.Client, opts ...Option) *Broker {
+	b := &Broker{
+		rdb:         rdb,
+		backoffBase: time.Second,
+		backoffMax:  10 * time.Minute,
+		rnd:         rand.New(rand.NewSource(time.Now().UnixNano())),
+	}
+	for _, opt := range opts {
+		opt(b)
+	}
+	return b
 }
 
 // jobKeyPrefix namespaces every job hash. It is also handed to the claim script
@@ -46,16 +77,58 @@ func inflightKey(queue string) string { return "q:" + queue + ":inflight" }
 // jobs land once they exhaust their retry budget.
 func dlqKey(queue string) string { return "q:" + queue + ":dlq" }
 
-// Enqueue makes a job available for workers to claim: it persists the job hash
-// and adds the id to the queue's ready set. Both writes run in one transaction
-// so a crash can never leave a job hash with no ready entry, or vice versa.
-//
-// The ready-set score is the job's priority; until priorities are wired up every
-// job enqueues at score 0.
-func (b *Broker) Enqueue(ctx context.Context, j job.Job) error {
+// delayedKey is the Redis key for a queue's delayed set: `q:{name}:delayed`, a
+// ZSET scored by each job's ready-at time. The promoter scans it.
+func delayedKey(queue string) string { return "q:" + queue + ":delayed" }
+
+// enqueueConfig holds resolved enqueue options. A zero readyAt means "now".
+type enqueueConfig struct {
+	readyAt time.Time
+}
+
+// EnqueueOption customises a single Enqueue call.
+type EnqueueOption func(*enqueueConfig)
+
+// WithDelay schedules the job to become claimable after d from now. A d <= 0 is
+// equivalent to a plain enqueue.
+func WithDelay(d time.Duration) EnqueueOption {
+	return func(c *enqueueConfig) {
+		if d > 0 {
+			c.readyAt = time.Now().Add(d)
+		}
+	}
+}
+
+// WithReadyAt schedules the job to become claimable at t. A zero t, or a t at or
+// before now, is equivalent to a plain enqueue.
+func WithReadyAt(t time.Time) EnqueueOption {
+	return func(c *enqueueConfig) {
+		if !t.IsZero() {
+			c.readyAt = t
+		}
+	}
+}
+
+// Enqueue makes a job available for workers to claim. With no option it goes
+// straight to the ready set; with a future ready-at it goes to the delayed set
+// for the promoter to release later. The job hash and the set membership are
+// written in one transaction so a crash can never leave one without the other.
+func (b *Broker) Enqueue(ctx context.Context, j job.Job, opts ...EnqueueOption) error {
+	var cfg enqueueConfig
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+
 	pipe := b.rdb.TxPipeline()
-	pipe.HSet(ctx, jobKey(j.ID), j.ToHash())
-	pipe.ZAdd(ctx, readyKey(j.Queue), redis.Z{Score: 0, Member: j.ID})
+	if cfg.readyAt.After(time.Now()) {
+		j.State = job.StateDelayed
+		pipe.HSet(ctx, jobKey(j.ID), j.ToHash())
+		pipe.ZAdd(ctx, delayedKey(j.Queue), redis.Z{Score: float64(cfg.readyAt.UnixMilli()), Member: j.ID})
+	} else {
+		j.State = job.StateReady
+		pipe.HSet(ctx, jobKey(j.ID), j.ToHash())
+		pipe.ZAdd(ctx, readyKey(j.Queue), redis.Z{Score: 0, Member: j.ID})
+	}
 	if _, err := pipe.Exec(ctx); err != nil {
 		return fmt.Errorf("broker: enqueuing job %s: %w", j.ID, err)
 	}
@@ -108,13 +181,19 @@ func (b *Broker) Ack(ctx context.Context, j job.Job) error {
 }
 
 // Nack reports that a claimed job failed. If the job still has attempts left it
-// is requeued to ready for another try; once its retry budget is spent it is
-// moved to the dead-letter queue. The decision and the moves happen atomically
-// in nack.lua.
+// is requeued to the delayed set with a full-jitter backoff so the retry waits;
+// once its retry budget is spent it is moved to the dead-letter queue. The
+// decision and the move are atomic in nack.lua; the backoff delay is computed
+// here (jitter needs randomness) and passed in as a ready-at timestamp.
 func (b *Broker) Nack(ctx context.Context, j job.Job) error {
+	b.rndMu.Lock()
+	delay := nextBackoff(j.Attempts, b.backoffBase, b.backoffMax, b.rnd)
+	b.rndMu.Unlock()
+	readyAt := time.Now().Add(delay).UnixMilli()
+
 	if err := nackScript.Run(ctx, b.rdb,
-		[]string{inflightKey(j.Queue), readyKey(j.Queue), dlqKey(j.Queue)},
-		j.ID, jobKeyPrefix,
+		[]string{inflightKey(j.Queue), delayedKey(j.Queue), dlqKey(j.Queue)},
+		j.ID, jobKeyPrefix, readyAt,
 	).Err(); err != nil {
 		return fmt.Errorf("broker: nacking job %s: %w", j.ID, err)
 	}
@@ -125,6 +204,11 @@ func (b *Broker) Nack(ctx context.Context, j job.Job) error {
 // call can never block Redis scanning a huge inflight backlog. Callers run Reap
 // in a loop until it returns 0 to drain everything.
 const defaultReapBatch = 100
+
+// defaultPromoteBatch bounds how many jobs a single Promote pass releases, so
+// one call cannot block Redis scanning a huge delayed backlog. Callers loop
+// until it returns 0 to drain everything due.
+const defaultPromoteBatch = 100
 
 // Reap requeues jobs whose visibility deadline has passed: workers that claimed
 // them have crashed or stalled without acking. Each expired job is moved from
@@ -139,6 +223,21 @@ func (b *Broker) Reap(ctx context.Context, queue string) (int, error) {
 	).Int()
 	if err != nil {
 		return 0, fmt.Errorf("broker: reaping %q: %w", queue, err)
+	}
+	return n, nil
+}
+
+// Promote releases delayed jobs whose ready-at time has passed, moving them from
+// the delayed set back to ready (atomically, in promote.lua). It returns the
+// number promoted in this pass; a return of defaultPromoteBatch means more may
+// remain, so call again.
+func (b *Broker) Promote(ctx context.Context, queue string) (int, error) {
+	n, err := promoteScript.Run(ctx, b.rdb,
+		[]string{delayedKey(queue), readyKey(queue)},
+		time.Now().UnixMilli(), jobKeyPrefix, defaultPromoteBatch,
+	).Int()
+	if err != nil {
+		return 0, fmt.Errorf("broker: promoting %q: %w", queue, err)
 	}
 	return n, nil
 }
