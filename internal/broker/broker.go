@@ -9,6 +9,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/rand"
+	"sync"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -17,14 +19,43 @@ import (
 )
 
 // Broker talks to a single Redis instance. It is safe for concurrent use: all
-// state lives in Redis, and the type itself holds only the client.
+// queue state lives in Redis, and the only mutable in-process state is the
+// jitter source, which is mutex-guarded.
 type Broker struct {
-	rdb *redis.Client
+	rdb         *redis.Client
+	backoffBase time.Duration
+	backoffMax  time.Duration
+
+	rndMu sync.Mutex
+	rnd   *rand.Rand
 }
 
-// New returns a Broker backed by the given Redis client.
-func New(rdb *redis.Client) *Broker {
-	return &Broker{rdb: rdb}
+// Option customises a Broker at construction.
+type Option func(*Broker)
+
+// WithBackoff sets the retry backoff base and ceiling. The nth retry waits a
+// full-jitter delay in [0, min(maxDelay, base*2^(n-1))); if base > maxDelay the
+// ceiling is always maxDelay.
+func WithBackoff(base, maxDelay time.Duration) Option {
+	return func(b *Broker) {
+		b.backoffBase = base
+		b.backoffMax = maxDelay
+	}
+}
+
+// New returns a Broker backed by the given Redis client. Defaults: backoff base
+// 1s, ceiling 10m.
+func New(rdb *redis.Client, opts ...Option) *Broker {
+	b := &Broker{
+		rdb:         rdb,
+		backoffBase: time.Second,
+		backoffMax:  10 * time.Minute,
+		rnd:         rand.New(rand.NewSource(time.Now().UnixNano())),
+	}
+	for _, opt := range opts {
+		opt(b)
+	}
+	return b
 }
 
 // jobKeyPrefix namespaces every job hash. It is also handed to the claim script
@@ -150,13 +181,19 @@ func (b *Broker) Ack(ctx context.Context, j job.Job) error {
 }
 
 // Nack reports that a claimed job failed. If the job still has attempts left it
-// is requeued to ready for another try; once its retry budget is spent it is
-// moved to the dead-letter queue. The decision and the moves happen atomically
-// in nack.lua.
+// is requeued to the delayed set with a full-jitter backoff so the retry waits;
+// once its retry budget is spent it is moved to the dead-letter queue. The
+// decision and the move are atomic in nack.lua; the backoff delay is computed
+// here (jitter needs randomness) and passed in as a ready-at timestamp.
 func (b *Broker) Nack(ctx context.Context, j job.Job) error {
+	b.rndMu.Lock()
+	delay := nextBackoff(j.Attempts, b.backoffBase, b.backoffMax, b.rnd)
+	b.rndMu.Unlock()
+	readyAt := time.Now().Add(delay).UnixMilli()
+
 	if err := nackScript.Run(ctx, b.rdb,
-		[]string{inflightKey(j.Queue), readyKey(j.Queue), dlqKey(j.Queue)},
-		j.ID, jobKeyPrefix,
+		[]string{inflightKey(j.Queue), delayedKey(j.Queue), dlqKey(j.Queue)},
+		j.ID, jobKeyPrefix, readyAt,
 	).Err(); err != nil {
 		return fmt.Errorf("broker: nacking job %s: %w", j.ID, err)
 	}
