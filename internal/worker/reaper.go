@@ -25,42 +25,15 @@ func NewReaper(b *broker.Broker, queue string, interval time.Duration) *Reaper {
 		broker:   b,
 		queue:    queue,
 		interval: interval,
-		logger:   slog.Default(),
+		logger:   slog.Default().With("queue", queue),
 	}
 }
 
 // Run requeues expired jobs every interval until ctx is cancelled, then returns
-// nil. Each tick drains all currently-expired jobs before sleeping again, so a
-// burst of timeouts is cleared promptly rather than one batch per interval.
+// nil. Each tick drains all currently-expired jobs before sleeping again (see
+// runDrainLoop), so a burst of timeouts is cleared promptly.
 func (r *Reaper) Run(ctx context.Context) error {
-	for {
-		if ctx.Err() != nil {
-			return nil
-		}
-		if err := r.reapAll(ctx); err != nil {
-			if ctx.Err() != nil {
-				return nil // failure caused by shutdown
-			}
-			// A transient Redis error should not kill the reaper; log and retry
-			// on the next tick.
-			r.logger.Error("relay reaper: reap failed", "queue", r.queue, "err", err)
-		}
-		if !wait(ctx, r.interval) {
-			return nil
-		}
-	}
-}
-
-// reapAll calls Reap until a pass requeues nothing, meaning the inflight set has
-// no more past-due jobs for now.
-func (r *Reaper) reapAll(ctx context.Context) error {
-	for {
-		n, err := r.broker.Reap(ctx, r.queue)
-		if err != nil {
-			return err
-		}
-		if n == 0 {
-			return nil
-		}
-	}
+	return runDrainLoop(ctx, r.interval, r.logger, "reaper", func(c context.Context) (int, error) {
+		return r.broker.Reap(c, r.queue)
+	})
 }
