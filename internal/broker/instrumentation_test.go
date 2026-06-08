@@ -252,14 +252,16 @@ func TestPromoteRecordsPromotedCount(t *testing.T) {
 	b, _ := newTestBrokerWith(t, broker.WithMetrics(fm))
 	ctx := context.Background()
 
-	// Enqueue two delayed jobs whose ready-at is just in the future, then wait.
-	soon := time.Now().Add(20 * time.Millisecond)
+	// Enqueue two delayed jobs whose ready-at is just in the future, then wait
+	// well past it. The sleep margin is generous (>3x) so the test stays reliable
+	// on a loaded CI runner under -race.
+	soon := time.Now().Add(30 * time.Millisecond)
 	for i := 0; i < 2; i++ {
 		if err := b.Enqueue(ctx, job.New("emails", []byte("x")), broker.WithReadyAt(soon)); err != nil {
 			t.Fatalf("Enqueue delayed: %v", err)
 		}
 	}
-	time.Sleep(40 * time.Millisecond)
+	time.Sleep(100 * time.Millisecond)
 
 	n, err := b.Promote(ctx, "emails")
 	if err != nil {
