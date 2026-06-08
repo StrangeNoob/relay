@@ -199,8 +199,10 @@ func (b *Broker) Enqueue(ctx context.Context, j job.Job, opts ...EnqueueOption) 
 		return fmt.Errorf("broker: enqueuing job %s: %w", j.ID, err)
 	}
 	if res == "dup" {
+		b.metrics.IncDeduplicated(j.Queue)
 		return ErrDuplicate
 	}
+	b.metrics.IncEnqueued(j.Queue)
 	return nil
 }
 
