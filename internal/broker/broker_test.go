@@ -1165,3 +1165,46 @@ func TestClaimUnlimitedCreatesNoBucket(t *testing.T) {
 		t.Errorf("ratelimit bucket created for an unlimited queue")
 	}
 }
+
+// TestRateLimitConcurrentClaimsRespectBurst verifies that the atomic token-bucket
+// inside claim.lua never over-issues under concurrent pressure. With burst=5 and a
+// negligible refill rate, exactly 5 of 20 simultaneous goroutines should succeed;
+// the remaining 15 must be denied by the Lua script without a race.
+func TestRateLimitConcurrentClaimsRespectBurst(t *testing.T) {
+	_, rdb := newTestBroker(t)
+	ctx := context.Background()
+	b := broker.New(rdb, broker.WithRateLimit("emails", 1, 5)) // burst 5, ~no refill in the window
+
+	const njobs = 50
+	for i := 0; i < njobs; i++ {
+		if err := b.Enqueue(ctx, job.New("emails", []byte("x"))); err != nil {
+			t.Fatalf("Enqueue: %v", err)
+		}
+	}
+
+	const nclaims = 20
+	var claimed int64
+	var wg sync.WaitGroup
+	for i := 0; i < nclaims; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, ok, err := b.Claim(ctx, "emails", time.Minute)
+			if err != nil {
+				t.Errorf("Claim: %v", err)
+				return
+			}
+			if ok {
+				atomic.AddInt64(&claimed, 1)
+			}
+		}()
+	}
+	wg.Wait()
+
+	if claimed != 5 {
+		t.Errorf("claimed %d, want exactly 5 (the burst)", claimed)
+	}
+	if n, _ := rdb.ZCard(ctx, "q:emails:inflight").Result(); n != 5 {
+		t.Errorf("inflight = %d, want 5", n)
+	}
+}
