@@ -45,4 +45,8 @@ services:
     depends_on:
       server:
         condition: service_started
-    restart: "no"
+    # depends_on only waits for the server container to start, not for its port to
+    # bind. on-failure lets the one-shot demo retry through that brief startup race
+    # (the distroless image has no shell/curl for a proper HTTP healthcheck); once
+    # it succeeds it exits 0 and is not restarted.
+    restart: on-failure

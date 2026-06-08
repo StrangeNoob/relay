@@ -1,7 +1,8 @@
 # syntax=docker/dockerfile:1
 
 # --- builder ---
-FROM golang:1.25 AS build
+# Pinned to match the toolchain in go.mod (toolchain go1.25.11).
+FROM golang:1.25.11 AS build
 WORKDIR /src
 
 # Cache module downloads.

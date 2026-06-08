@@ -62,9 +62,12 @@ were always out of scope. Repo: <https://github.com/StrangeNoob/relay>. What exi
   Go module gains no dependency.
 - `Dockerfile` — multi-stage distroless image; builds all three binaries (`cmd/server`,
   `cmd/worker`, `cmd/demo`) into one shared image (compose tags it `relay:local`).
+- `.dockerignore` — trims the Docker build context (excludes `.git`, `web/node_modules`,
+  `.superpowers`, `docs`); keeps `web/dist` so the server can embed it.
 - `deployments/docker-compose.yml` — redis + server + worker (1 by default, scale with
-  `--scale worker=N`) + one-shot demo; `docker compose up --build` brings up a fully working
-  end-to-end stack (dashboard at `/`, `/healthz`, `/metrics` all functional).
+  `--scale worker=N`) + one-shot demo; `docker compose -f deployments/docker-compose.yml up --build`
+  brings up a fully working end-to-end stack (dashboard at `/`, `/healthz`, `/metrics` all
+  functional).
 - `README.md` — portfolio front page with Mermaid architecture diagram, feature list, quickstart
   (native + Docker), and deploy notes.
 - `.github/workflows/ci.yml` — Redis service + `go test -race` + `golangci-lint` + dashboard
@@ -112,7 +115,7 @@ spec disagree, the spec wins until the spec is deliberately updated.
 - **Committed `web/dist` must be rebuilt on UI change.** The Go binary embeds the committed dist; CI has a `git diff --exit-code -- dist` step to catch stale builds. Run `cd web && npm run build` and commit the updated dist whenever source changes.
 - **Producer SDK does no client-side retries.** `internal/client` makes one HTTP request per call; transient failures are surfaced as errors. The caller is responsible for retry logic (with backoff) if needed.
 - **`cmd/demo` requires a running `cmd/server`.** The demo load generator now produces jobs through the HTTP SDK (`-server` flag) and no longer talks to Redis directly. Running `cmd/demo` without `cmd/server` will produce connection errors immediately.
-- **Docker/Compose packaging notes.** The compose Redis has no volume mount — data is ephemeral and lost on `docker compose down`. The `demo` service is one-shot (exits after enqueuing); workers and server continue running. The distroless image has no shell (`/bin/sh` is absent), so `docker exec` interactive debugging is not available. Deploying to a live environment (Railway, Fly.io, etc.) is the operator's step; the compose stack is a local demo, not a production-hardened deployment.
+- **Docker/Compose packaging notes.** The compose Redis has no volume mount — data is ephemeral and lost on `docker compose down`. The `demo` service is one-shot (exits 0 after enqueuing; `restart: on-failure` lets it retry through the brief server-startup race); workers and server continue running. The distroless image has no shell (`/bin/sh` is absent), so `docker exec` interactive debugging is not available. Deploying to a live environment (Railway, Fly.io, etc.) is the operator's step; the compose stack is a local demo, not a production-hardened deployment.
 
 ## Redis data model & job lifecycle (the architecture in brief)
 
@@ -170,6 +173,7 @@ internal/api/                      # ✅ JSON REST API handler (Phase 3a)
 internal/client/                   # ✅ stdlib-only HTTP producer SDK (Phase 3c)
 web/                               # ✅ Vite+React dashboard + web/embed.go (Phase 3b)
 Dockerfile                         # ✅ multi-stage distroless image (Phase 3d)
+.dockerignore                      # ✅ trims the Docker build context (Phase 3d)
 deployments/docker-compose.yml     # ✅ redis + server + N workers + demo (Phase 3d)
 README.md                          # ✅ portfolio front page with diagram + quickstart (Phase 3d)
 .github/workflows/ci.yml           # ✅ Redis service + go test -race + golangci-lint + dashboard CI + docker build
