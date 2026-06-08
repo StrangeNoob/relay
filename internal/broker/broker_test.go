@@ -1215,3 +1215,47 @@ func TestRateLimitConcurrentClaimsRespectBurst(t *testing.T) {
 		t.Errorf("inflight = %d, want 5", n)
 	}
 }
+
+func TestStatsCountsEachState(t *testing.T) {
+	b, rdb := newTestBroker(t)
+	ctx := context.Background()
+
+	// 2 ready
+	for i := 0; i < 2; i++ {
+		if err := b.Enqueue(ctx, job.New("emails", []byte("r"))); err != nil {
+			t.Fatalf("Enqueue ready: %v", err)
+		}
+	}
+	// 1 delayed
+	if err := b.Enqueue(ctx, job.New("emails", []byte("d")), broker.WithDelay(time.Hour)); err != nil {
+		t.Fatalf("Enqueue delayed: %v", err)
+	}
+	// 1 inflight: enqueue then claim it
+	if err := b.Enqueue(ctx, job.New("emails", []byte("i"))); err != nil {
+		t.Fatalf("Enqueue inflight: %v", err)
+	}
+	if _, ok, err := b.Claim(ctx, "emails", time.Minute); err != nil || !ok {
+		t.Fatalf("Claim: ok=%v err=%v", ok, err)
+	}
+	// 1 dlq: push an id directly so the count is unambiguous
+	if err := rdb.RPush(ctx, "q:emails:dlq", "deadid").Err(); err != nil {
+		t.Fatalf("seed dlq: %v", err)
+	}
+
+	s, err := b.Stats(ctx, "emails")
+	if err != nil {
+		t.Fatalf("Stats: %v", err)
+	}
+	if s.Ready != 2 {
+		t.Errorf("Ready = %d, want 2", s.Ready)
+	}
+	if s.Inflight != 1 {
+		t.Errorf("Inflight = %d, want 1", s.Inflight)
+	}
+	if s.Delayed != 1 {
+		t.Errorf("Delayed = %d, want 1", s.Delayed)
+	}
+	if s.DLQ != 1 {
+		t.Errorf("DLQ = %d, want 1", s.DLQ)
+	}
+}

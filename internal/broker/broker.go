@@ -353,6 +353,34 @@ func (b *Broker) Extend(ctx context.Context, j job.Job, visibility time.Duration
 	return n == 1, nil
 }
 
+// Stats is a point-in-time count of a queue's jobs by state. Each field is the
+// cardinality of the corresponding Redis structure for the queue.
+type Stats struct {
+	Ready    int64 `json:"ready"`
+	Inflight int64 `json:"inflight"`
+	Delayed  int64 `json:"delayed"`
+	DLQ      int64 `json:"dlq"`
+}
+
+// Stats returns the current depth of each of a queue's states in one round trip.
+// ready/inflight/delayed are ZSETs (ZCARD); the dlq is a list (LLEN).
+func (b *Broker) Stats(ctx context.Context, queue string) (Stats, error) {
+	pipe := b.rdb.Pipeline()
+	ready := pipe.ZCard(ctx, readyKey(queue))
+	inflight := pipe.ZCard(ctx, inflightKey(queue))
+	delayed := pipe.ZCard(ctx, delayedKey(queue))
+	dlq := pipe.LLen(ctx, dlqKey(queue))
+	if _, err := pipe.Exec(ctx); err != nil {
+		return Stats{}, fmt.Errorf("broker: stats for %q: %w", queue, err)
+	}
+	return Stats{
+		Ready:    ready.Val(),
+		Inflight: inflight.Val(),
+		Delayed:  delayed.Val(),
+		DLQ:      dlq.Val(),
+	}, nil
+}
+
 // hashFromLua converts the flat HGETALL array a script returns (alternating
 // field, value, field, value …) into a Go map. go-redis decodes a Lua table as
 // []interface{} of strings.
