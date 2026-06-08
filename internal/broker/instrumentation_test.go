@@ -165,3 +165,54 @@ func TestAckRecordsProcessedAndLatency(t *testing.T) {
 		t.Errorf("latency = %v, want non-negative", d)
 	}
 }
+
+// nackTestJob enqueues, claims, and returns a job set up so the next Nack takes
+// the requested branch. maxRetries controls retry-vs-dead: with maxRetries=5 the
+// first nack retries; with maxRetries=0 the first nack dead-letters.
+func nackTestJob(t *testing.T, b *broker.Broker, ctx context.Context, maxRetries int) job.Job {
+	t.Helper()
+	j := job.New("emails", []byte("x"))
+	j.MaxRetries = maxRetries
+	if err := b.Enqueue(ctx, j); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	claimed, ok, err := b.Claim(ctx, "emails", time.Minute)
+	if err != nil || !ok {
+		t.Fatalf("Claim: ok=%v err=%v", ok, err)
+	}
+	return claimed
+}
+
+func TestNackWithRetriesLeftRecordsRetried(t *testing.T) {
+	fm := newFakeMetrics()
+	b, _ := newTestBrokerWith(t, broker.WithMetrics(fm))
+	ctx := context.Background()
+
+	j := nackTestJob(t, b, ctx, 5) // attempts now 1 < 5 -> retry
+	if err := b.Nack(ctx, j); err != nil {
+		t.Fatalf("Nack: %v", err)
+	}
+	if got := fm.get(fm.retried, "emails"); got != 1 {
+		t.Errorf("retried[emails] = %d, want 1", got)
+	}
+	if got := fm.get(fm.dead, "emails"); got != 0 {
+		t.Errorf("dead[emails] = %d, want 0", got)
+	}
+}
+
+func TestNackWithBudgetSpentRecordsDead(t *testing.T) {
+	fm := newFakeMetrics()
+	b, _ := newTestBrokerWith(t, broker.WithMetrics(fm))
+	ctx := context.Background()
+
+	j := nackTestJob(t, b, ctx, 0) // attempts now 1, max 0 -> dead
+	if err := b.Nack(ctx, j); err != nil {
+		t.Fatalf("Nack: %v", err)
+	}
+	if got := fm.get(fm.dead, "emails"); got != 1 {
+		t.Errorf("dead[emails] = %d, want 1", got)
+	}
+	if got := fm.get(fm.retried, "emails"); got != 0 {
+		t.Errorf("retried[emails] = %d, want 0", got)
+	}
+}

@@ -270,11 +270,18 @@ func (b *Broker) Nack(ctx context.Context, j job.Job) error {
 	b.rndMu.Unlock()
 	readyAt := time.Now().Add(delay).UnixMilli()
 
-	if err := nackScript.Run(ctx, b.rdb,
+	outcome, err := nackScript.Run(ctx, b.rdb,
 		[]string{inflightKey(j.Queue), delayedKey(j.Queue), dlqKey(j.Queue)},
 		j.ID, jobKeyPrefix, readyAt,
-	).Err(); err != nil {
+	).Text()
+	if err != nil {
 		return fmt.Errorf("broker: nacking job %s: %w", j.ID, err)
+	}
+	switch outcome {
+	case "retry":
+		b.metrics.IncRetried(j.Queue)
+	case "dead":
+		b.metrics.IncDead(j.Queue)
 	}
 	return nil
 }
