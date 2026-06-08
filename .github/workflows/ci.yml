@@ -91,3 +91,12 @@ jobs:
       # Fail if the committed web/dist is stale vs a fresh build of the source.
       - name: Verify committed dist is in sync
         run: git diff --exit-code -- dist
+
+  docker:
+    name: docker build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build image
+        run: docker build -t relay:ci .

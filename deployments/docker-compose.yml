@@ -1,0 +1,52 @@
+# Runs the whole Relay system end-to-end: Redis, the API/dashboard server, a pool
+# of workers (competing consumers + reaper + promoter), and a one-shot demo load
+# generator. Open http://localhost:8080 after `up` to watch the dashboard.
+#
+#   docker compose -f deployments/docker-compose.yml up --build
+#   docker compose -f deployments/docker-compose.yml up --build --scale worker=3
+
+services:
+  redis:
+    image: redis:7
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+  server:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: relay:local
+    command: ["/usr/local/bin/server", "-addr", ":8080", "-redis", "redis:6379", "-queues", "demo"]
+    ports:
+      - "8080:8080"
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  worker:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: relay:local
+    command: ["/usr/local/bin/worker", "-redis", "redis:6379", "-queue", "demo", "-concurrency", "4", "-fail-rate", "0.1"]
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  demo:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: relay:local
+    command: ["/usr/local/bin/demo", "-server", "http://server:8080", "-queue", "demo", "-count", "200"]
+    depends_on:
+      server:
+        condition: service_started
+    # depends_on only waits for the server container to start, not for its port to
+    # bind. on-failure lets the one-shot demo retry through that brief startup race
+    # (the distroless image has no shell/curl for a proper HTTP healthcheck); once
+    # it succeeds it exits 0 and is not restarted.
+    restart: on-failure
