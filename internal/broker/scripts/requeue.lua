@@ -20,6 +20,9 @@ if removed == 0 then
   return 0
 end
 
+-- Assumes the job hash still exists: under normal Relay operation a hash is only
+-- deleted by ack.lua (which removes from inflight, never the DLQ), so an id in
+-- the DLQ always has its hash.
 local job_key = ARGV[2] .. ARGV[1]
 local priority = tonumber(redis.call('HGET', job_key, 'priority')) or 0
 redis.call('HSET', job_key, 'state', 'ready', 'attempts', 0)
