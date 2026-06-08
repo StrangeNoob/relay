@@ -10,9 +10,10 @@ project: the point is to *prove understanding of queue internals*, not to wrap a
 library. Do not introduce a queue dependency (BullMQ, asynq, Machinery, Celery, etc.) — the
 mechanics are the deliverable.
 
-**Status: Phase 1 complete; Phase 2a complete.** The core engine plus delayed jobs, the promoter,
-and retry backoff are built, tested against a real Redis under `-race`, and CI is green. Repo:
-<https://github.com/StrangeNoob/relay>. What exists today:
+**Status: Phase 1 complete; Phase 2 nearly complete.** The core engine plus delayed jobs, the
+promoter, retry backoff, priority, idempotency enforcement, and per-queue rate limiting are built,
+tested against a real Redis under `-race`, and CI is green (only Prometheus metrics remain in
+Phase 2). Repo: <https://github.com/StrangeNoob/relay>. What exists today:
 
 - `internal/job` — the `Job` model + Redis-hash encoding (`ToHash`/`FromHash`).
 - `internal/broker` — `Enqueue` (with `WithDelay`/`WithReadyAt`/`WithPriority`/`WithIdempotencyKey` options), atomic `Claim`, `Ack`,
@@ -26,8 +27,8 @@ and retry backoff are built, tested against a real Redis under `-race`, and CI i
   generator with `--delay`).
 - `.github/workflows/ci.yml` — Redis service + `go test -race` + `golangci-lint`.
 
-Remaining Phase 2 (priority, idempotency enforcement, per-queue rate limiting, Prometheus metrics)
-and Phase 3 (API/dashboard/`cmd/server`, docker-compose, deploy) are **not** built yet.
+Remaining Phase 2 (Prometheus metrics) and Phase 3 (API/dashboard/`cmd/server`, docker-compose,
+deploy) are **not** built yet.
 
 ## Source of truth
 
