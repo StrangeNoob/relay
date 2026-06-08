@@ -1373,3 +1373,38 @@ func TestRequeueDLQUnknownIDReturnsFalse(t *testing.T) {
 		t.Error("RequeueDLQ returned true for an id not in the DLQ, want false")
 	}
 }
+
+func TestQueuesDiscoversDistinctNames(t *testing.T) {
+	b, _ := newTestBroker(t)
+	ctx := context.Background()
+
+	if err := b.Enqueue(ctx, job.New("emails", []byte("a"))); err != nil {
+		t.Fatalf("Enqueue emails: %v", err)
+	}
+	if err := b.Enqueue(ctx, job.New("sms", []byte("b"))); err != nil {
+		t.Fatalf("Enqueue sms: %v", err)
+	}
+	// a second key family for the same queue must not double-count it
+	if err := b.Enqueue(ctx, job.New("emails", []byte("c")), broker.WithDelay(time.Hour)); err != nil {
+		t.Fatalf("Enqueue emails delayed: %v", err)
+	}
+
+	names, err := b.Queues(ctx)
+	if err != nil {
+		t.Fatalf("Queues: %v", err)
+	}
+	if len(names) != 2 || names[0] != "emails" || names[1] != "sms" {
+		t.Errorf("names = %v, want [emails sms]", names)
+	}
+}
+
+func TestQueuesEmpty(t *testing.T) {
+	b, _ := newTestBroker(t)
+	names, err := b.Queues(context.Background())
+	if err != nil {
+		t.Fatalf("Queues: %v", err)
+	}
+	if len(names) != 0 {
+		t.Errorf("names = %v, want empty", names)
+	}
+}

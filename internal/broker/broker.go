@@ -10,6 +10,8 @@ import (
 	"errors"
 	"fmt"
 	"math/rand"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -435,6 +437,41 @@ func (b *Broker) RequeueDLQ(ctx context.Context, queue, id string) (bool, error)
 		return false, fmt.Errorf("broker: requeuing dlq job %s: %w", id, err)
 	}
 	return n == 1, nil
+}
+
+// Queues discovers the distinct queue names present in Redis by scanning for the
+// per-queue key prefix `q:{name}:...`. It uses a non-blocking SCAN cursor loop,
+// dedupes, and returns the names sorted for stable output. On a large keyspace
+// this still iterates every key (bounded work per round trip).
+func (b *Broker) Queues(ctx context.Context) ([]string, error) {
+	seen := make(map[string]struct{})
+	var cursor uint64
+	for {
+		keys, next, err := b.rdb.Scan(ctx, cursor, "q:*", 200).Result()
+		if err != nil {
+			return nil, fmt.Errorf("broker: scanning queues: %w", err)
+		}
+		for _, k := range keys {
+			// k is "q:{name}:{suffix...}"; the name is the segment between the
+			// leading "q:" and the next ":".
+			rest := strings.TrimPrefix(k, "q:")
+			i := strings.IndexByte(rest, ':')
+			if i <= 0 {
+				continue
+			}
+			seen[rest[:i]] = struct{}{}
+		}
+		cursor = next
+		if cursor == 0 {
+			break
+		}
+	}
+	names := make([]string, 0, len(seen))
+	for n := range seen {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	return names, nil
 }
 
 // hashFromLua converts the flat HGETALL array a script returns (alternating
