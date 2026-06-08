@@ -245,7 +245,7 @@ func TestStreamEmitsSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GET stream: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "text/event-stream") {
 		t.Fatalf("Content-Type = %q, want text/event-stream", ct)
 	}
