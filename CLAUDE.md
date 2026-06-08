@@ -113,11 +113,13 @@ enqueue(WithDelay) → delayed ──[promoter: ready-at≤now]──→ ready
   nack  → attempts<maxRetries ? delayed (now + full-jitter backoff) : dlq
   reaper   (bg): inflight where deadline<=now → ready  # at-least-once on crash
   promoter (bg): delayed  where ready-at<=now  → ready  # releases scheduled + backed-off jobs
+  requeue (operator): dlq → ready (attempts reset to 0)  # RequeueDLQ via the API
 ```
 
-Two background loops (reaper, promoter) plus the worker claim loop are the only things that
-move jobs between states. Heartbeat (`broker.Extend`, `ZADD XX`) pushes a job's `inflight`
-deadline forward while a long handler runs, so the reaper does not reclaim live work.
+Two background loops (reaper, promoter) plus the worker claim loop move jobs between states
+automatically; the only operator-driven transition is `RequeueDLQ` (dlq→ready, exposed via the
+API). Heartbeat (`broker.Extend`, `ZADD XX`) pushes a job's `inflight` deadline forward while a
+long handler runs, so the reaper does not reclaim live work.
 
 ## Layout (✅ built · ◻ planned)
 
