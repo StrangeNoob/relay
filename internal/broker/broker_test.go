@@ -1457,3 +1457,40 @@ func TestNackRetryDoesNotIncrementDeadCounter(t *testing.T) {
 		t.Errorf("q:emails:dead = %d, want 0 (retry must not increment)", n)
 	}
 }
+
+func TestCountersReadsProcessedAndDead(t *testing.T) {
+	b, _ := newTestBroker(t)
+	ctx := context.Background()
+
+	// process one (ack) and dead-letter one
+	if err := b.Enqueue(ctx, job.New("emails", []byte("ok"))); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	j, ok, err := b.Claim(ctx, "emails", time.Minute)
+	if err != nil || !ok {
+		t.Fatalf("Claim: %v %v", ok, err)
+	}
+	if err := b.Ack(ctx, j); err != nil {
+		t.Fatalf("Ack: %v", err)
+	}
+	_ = deadLetter(t, b, ctx, "emails", "bad")
+
+	c, err := b.Counters(ctx, "emails")
+	if err != nil {
+		t.Fatalf("Counters: %v", err)
+	}
+	if c.Processed != 1 || c.Dead != 1 {
+		t.Errorf("Counters = %+v, want {Processed:1 Dead:1}", c)
+	}
+}
+
+func TestCountersUntouchedQueueIsZero(t *testing.T) {
+	b, _ := newTestBroker(t)
+	c, err := b.Counters(context.Background(), "emails")
+	if err != nil {
+		t.Fatalf("Counters: %v", err)
+	}
+	if c.Processed != 0 || c.Dead != 0 {
+		t.Errorf("Counters = %+v, want zeros", c)
+	}
+}

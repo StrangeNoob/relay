@@ -392,6 +392,44 @@ func (b *Broker) Stats(ctx context.Context, queue string) (Stats, error) {
 	}, nil
 }
 
+// Counters is a queue's cumulative, monotonic lifetime totals — distinct from the
+// point-in-time depths in Stats. They back the dashboard's throughput rate.
+type Counters struct {
+	Processed int64 `json:"processed_total"`
+	Dead      int64 `json:"dead_total"`
+}
+
+// Counters reads a queue's processed/dead counters in one pipeline. A missing
+// key (queue never acked/dead-lettered) reads as 0, not an error.
+func (b *Broker) Counters(ctx context.Context, queue string) (Counters, error) {
+	pipe := b.rdb.Pipeline()
+	pCmd := pipe.Get(ctx, processedKey(queue))
+	dCmd := pipe.Get(ctx, deadKey(queue))
+	// A GET on a missing key yields redis.Nil, which Exec surfaces as an error;
+	// that is expected here, so only a non-Nil error is a real failure.
+	if _, err := pipe.Exec(ctx); err != nil && !errors.Is(err, redis.Nil) {
+		return Counters{}, fmt.Errorf("broker: counters for %q: %w", queue, err)
+	}
+	processed, err := getInt64OrZero(pCmd)
+	if err != nil {
+		return Counters{}, fmt.Errorf("broker: counters for %q: %w", queue, err)
+	}
+	dead, err := getInt64OrZero(dCmd)
+	if err != nil {
+		return Counters{}, fmt.Errorf("broker: counters for %q: %w", queue, err)
+	}
+	return Counters{Processed: processed, Dead: dead}, nil
+}
+
+// getInt64OrZero reads a GET result as int64, treating a missing key as 0.
+func getInt64OrZero(cmd *redis.StringCmd) (int64, error) {
+	v, err := cmd.Int64()
+	if errors.Is(err, redis.Nil) {
+		return 0, nil
+	}
+	return v, err
+}
+
 // DLQ listing bounds: an unset/zero limit uses the default; the max caps a single
 // page so a huge DLQ cannot be slurped in one request.
 const (
