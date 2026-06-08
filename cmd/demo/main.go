@@ -1,6 +1,6 @@
-// Command demo is a load generator: it enqueues a batch of jobs onto a queue so
-// a running worker pool has something to chew on. Thin wiring over the client
-// path of internal/broker.
+// Command demo is a load generator: it enqueues a batch of jobs onto a queue
+// through the Relay HTTP API (via internal/client) so a running worker pool has
+// something to chew on. It is a pure SDK consumer — it needs cmd/server running.
 package main
 
 import (
@@ -11,14 +11,11 @@ import (
 	"log/slog"
 	"os"
 
-	"github.com/redis/go-redis/v9"
-
-	"github.com/StrangeNoob/relay/internal/broker"
-	"github.com/StrangeNoob/relay/internal/job"
+	"github.com/StrangeNoob/relay/internal/client"
 )
 
 func main() {
-	addr := flag.String("redis", "localhost:6379", "Redis address")
+	server := flag.String("server", "http://localhost:8080", "Relay server base URL")
 	queue := flag.String("queue", "default", "queue to enqueue into")
 	count := flag.Int("count", 100, "number of jobs to enqueue")
 	delay := flag.Duration("delay", 0, "schedule jobs this far in the future (0 = immediate)")
@@ -27,32 +24,23 @@ func main() {
 	flag.Parse()
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
-
 	ctx := context.Background()
-	rdb := redis.NewClient(&redis.Options{Addr: *addr})
-	defer func() { _ = rdb.Close() }()
+	c := client.New(*server)
 
-	if err := rdb.Ping(ctx).Err(); err != nil {
-		logger.Error("cannot reach redis", "addr", *addr, "err", err)
-		os.Exit(1)
-	}
-
-	b := broker.New(rdb)
 	for i := range *count {
 		payload := fmt.Sprintf(`{"n":%d}`, i)
-		j := job.New(*queue, []byte(payload))
-		var opts []broker.EnqueueOption
+		var opts []client.EnqueueOption
 		if *delay > 0 {
-			opts = append(opts, broker.WithDelay(*delay))
+			opts = append(opts, client.WithDelay(*delay))
 		}
 		if *priority != 0 {
-			opts = append(opts, broker.WithPriority(*priority))
+			opts = append(opts, client.WithPriority(*priority))
 		}
 		if *idempotencyKey != "" {
-			opts = append(opts, broker.WithIdempotencyKey(*idempotencyKey))
+			opts = append(opts, client.WithIdempotencyKey(*idempotencyKey))
 		}
-		switch err := b.Enqueue(ctx, j, opts...); {
-		case errors.Is(err, broker.ErrDuplicate):
+		switch _, err := c.Enqueue(ctx, *queue, []byte(payload), opts...); {
+		case errors.Is(err, client.ErrDuplicate):
 			logger.Info("duplicate dropped", "i", i, "key", *idempotencyKey)
 		case err != nil:
 			logger.Error("enqueue failed", "i", i, "err", err)
@@ -60,5 +48,5 @@ func main() {
 		}
 	}
 
-	logger.Info("enqueued jobs", "count", *count, "queue", *queue, "redis", *addr)
+	logger.Info("enqueued jobs", "count", *count, "queue", *queue, "server", *server)
 }
