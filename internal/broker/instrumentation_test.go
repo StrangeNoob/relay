@@ -2,6 +2,7 @@ package broker_test
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -92,7 +93,7 @@ func TestEnqueueDuplicateRecordsDeduplicated(t *testing.T) {
 		t.Fatalf("first Enqueue: %v", err)
 	}
 	j2 := job.New("emails", []byte("b"))
-	if err := b.Enqueue(ctx, j2, broker.WithIdempotencyKey("k1")); err != broker.ErrDuplicate {
+	if err := b.Enqueue(ctx, j2, broker.WithIdempotencyKey("k1")); !errors.Is(err, broker.ErrDuplicate) {
 		t.Fatalf("second Enqueue err = %v, want ErrDuplicate", err)
 	}
 	if got := fm.get(fm.enqueued, "emails"); got != 1 {
