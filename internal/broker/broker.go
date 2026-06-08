@@ -92,6 +92,11 @@ func delayedKey(queue string) string { return "q:" + queue + ":delayed" }
 // `q:{name}:processed`, INCR'd by ack.lua. Read by the dashboard for throughput.
 func processedKey(queue string) string { return "q:" + queue + ":processed" }
 
+// deadKey is the Redis key for a queue's cumulative dead-letter counter:
+// `q:{name}:dead`, INCR'd by nack.lua on the dead branch. Read by the dashboard
+// to show total dead-lettered jobs without scanning the DLQ list.
+func deadKey(queue string) string { return "q:" + queue + ":dead" }
+
 // enqueueConfig holds resolved enqueue options. A zero readyAt means "now".
 type enqueueConfig struct {
 	readyAt           time.Time
@@ -277,7 +282,7 @@ func (b *Broker) Nack(ctx context.Context, j job.Job) error {
 	readyAt := time.Now().Add(delay).UnixMilli()
 
 	outcome, err := nackScript.Run(ctx, b.rdb,
-		[]string{inflightKey(j.Queue), delayedKey(j.Queue), dlqKey(j.Queue)},
+		[]string{inflightKey(j.Queue), delayedKey(j.Queue), dlqKey(j.Queue), deadKey(j.Queue)},
 		j.ID, jobKeyPrefix, readyAt,
 	).Text()
 	if err != nil {

@@ -1427,3 +1427,33 @@ func TestAckIncrementsProcessedCounter(t *testing.T) {
 		t.Errorf("q:emails:processed = %d, want 1", n)
 	}
 }
+
+func TestNackDeadIncrementsDeadCounter(t *testing.T) {
+	b, rdb := newTestBroker(t)
+	ctx := context.Background()
+
+	_ = deadLetter(t, b, ctx, "emails", "x")
+	if n, _ := rdb.Get(ctx, "q:emails:dead").Int64(); n != 1 {
+		t.Errorf("q:emails:dead = %d, want 1", n)
+	}
+}
+
+func TestNackRetryDoesNotIncrementDeadCounter(t *testing.T) {
+	b, rdb := newTestBroker(t)
+	ctx := context.Background()
+
+	j := job.New("emails", []byte("x")) // default MaxRetries=5 -> first nack retries
+	if err := b.Enqueue(ctx, j); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	claimed, ok, err := b.Claim(ctx, "emails", time.Minute)
+	if err != nil || !ok {
+		t.Fatalf("Claim: ok=%v err=%v", ok, err)
+	}
+	if err := b.Nack(ctx, claimed); err != nil {
+		t.Fatalf("Nack: %v", err)
+	}
+	if n, _ := rdb.Get(ctx, "q:emails:dead").Int64(); n != 0 {
+		t.Errorf("q:emails:dead = %d, want 0 (retry must not increment)", n)
+	}
+}
