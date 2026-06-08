@@ -12,7 +12,7 @@ import "time"
 // Every method takes the queue name so the implementation can label its series
 // per queue. Reap/Promote add a batch count because one call moves many jobs;
 // the rest are single events. ObserveLatency reports a job's end-to-end time in
-// the system (enqueue -> ack).
+// the system (creation -> ack).
 type Metrics interface {
 	IncEnqueued(queue string)
 	IncDeduplicated(queue string)

@@ -12,12 +12,15 @@ func TestNewDefaultsToNoopMetrics(t *testing.T) {
 	}
 }
 
+// distinctMetrics is a sentinel recorder with its own identity, so the test can
+// prove WithMetrics installed exactly this value (noopMetrics{} has no identity).
+type distinctMetrics struct{ noopMetrics }
+
 func TestWithMetricsInstallsRecorder(t *testing.T) {
-	rec := noopMetrics{} // any Metrics value; identity is what we check
-	var custom Metrics = rec
-	b := New(nil, WithMetrics(custom))
-	if b.metrics == nil {
-		t.Fatal("WithMetrics: metrics is nil")
+	rec := &distinctMetrics{}
+	b := New(nil, WithMetrics(rec))
+	if b.metrics != rec {
+		t.Fatalf("WithMetrics: metrics = %v, want the installed recorder", b.metrics)
 	}
 }
 
