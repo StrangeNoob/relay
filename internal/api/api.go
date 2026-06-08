@@ -140,8 +140,6 @@ func parseInt64(s string, def int64) (int64, error) {
 	return strconv.ParseInt(s, 10, 64)
 }
 
-// --- temporary stubs, replaced in Tasks 6-7 ---
-
 // stats handles GET /api/queues/{queue}/stats.
 func (a *API) stats(w http.ResponseWriter, r *http.Request) {
 	queue := r.PathValue("queue")
@@ -180,10 +178,30 @@ func (a *API) listDLQ(w http.ResponseWriter, r *http.Request) {
 	a.writeJSON(w, http.StatusOK, views)
 }
 
-func (a *API) requeueDLQ(w http.ResponseWriter, _ *http.Request) {
-	a.writeError(w, http.StatusNotImplemented, "not implemented")
+// requeueDLQ handles POST /api/queues/{queue}/dlq/{id}/requeue.
+func (a *API) requeueDLQ(w http.ResponseWriter, r *http.Request) {
+	queue := r.PathValue("queue")
+	id := r.PathValue("id")
+	ok, err := a.broker.RequeueDLQ(r.Context(), queue, id)
+	if err != nil {
+		a.logger.Error("api: requeue failed", "queue", queue, "id", id, "err", err)
+		a.writeError(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	if !ok {
+		a.writeError(w, http.StatusNotFound, "job not found in dlq")
+		return
+	}
+	a.writeJSON(w, http.StatusOK, map[string]bool{"requeued": true})
 }
 
-func (a *API) queues(w http.ResponseWriter, _ *http.Request) {
-	a.writeError(w, http.StatusNotImplemented, "not implemented")
+// queues handles GET /api/queues.
+func (a *API) queues(w http.ResponseWriter, r *http.Request) {
+	names, err := a.broker.Queues(r.Context())
+	if err != nil {
+		a.logger.Error("api: queues failed", "err", err)
+		a.writeError(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	a.writeJSON(w, http.StatusOK, names)
 }

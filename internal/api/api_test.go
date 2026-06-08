@@ -171,3 +171,58 @@ func TestDLQListBadLimitReturns400(t *testing.T) {
 		t.Errorf("status = %d, want 400", rec.Code)
 	}
 }
+
+func TestRequeueEndpointMovesJobBack(t *testing.T) {
+	h, _, rdb := newTestAPI(t)
+	ctx := context.Background()
+	j := mustJob("emails", "dead")
+	j.State = "dead"
+	if err := rdb.HSet(ctx, "job:"+j.ID, j.ToHash()).Err(); err != nil {
+		t.Fatalf("HSet: %v", err)
+	}
+	if err := rdb.RPush(ctx, "q:emails:dlq", j.ID).Err(); err != nil {
+		t.Fatalf("RPush: %v", err)
+	}
+
+	rec := do(t, h, http.MethodPost, "/api/queues/emails/dlq/"+j.ID+"/requeue", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if n, _ := rdb.ZCard(ctx, "q:emails:ready").Result(); n != 1 {
+		t.Errorf("ready card = %d, want 1", n)
+	}
+	if n, _ := rdb.LLen(ctx, "q:emails:dlq").Result(); n != 0 {
+		t.Errorf("dlq len = %d, want 0", n)
+	}
+}
+
+func TestRequeueUnknownReturns404(t *testing.T) {
+	h, _, _ := newTestAPI(t)
+	rec := do(t, h, http.MethodPost, "/api/queues/emails/dlq/nope/requeue", nil)
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want 404", rec.Code)
+	}
+}
+
+func TestQueuesEndpointListsNames(t *testing.T) {
+	h, b, _ := newTestAPI(t)
+	ctx := context.Background()
+	if err := b.Enqueue(ctx, mustJob("emails", "a")); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if err := b.Enqueue(ctx, mustJob("sms", "b")); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	rec := do(t, h, http.MethodGet, "/api/queues", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	var names []string
+	if err := json.Unmarshal(rec.Body.Bytes(), &names); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(names) != 2 || names[0] != "emails" || names[1] != "sms" {
+		t.Errorf("names = %v, want [emails sms]", names)
+	}
+}
