@@ -35,14 +35,24 @@ func newTestRedis(t *testing.T) *redis.Client {
 	return rdb
 }
 
+// mustSeed fails the test immediately if seeding a fixture into Redis errored.
+func mustSeed(t *testing.T, err error) {
+	t.Helper()
+	if err != nil {
+		t.Fatalf("seed redis: %v", err)
+	}
+}
+
 func TestDepthCollectorReportsDepths(t *testing.T) {
 	rdb := newTestRedis(t)
 	ctx := context.Background()
 
-	rdb.ZAdd(ctx, "q:emails:ready", redis.Z{Score: 1, Member: "a"}, redis.Z{Score: 2, Member: "b"})
-	rdb.ZAdd(ctx, "q:emails:inflight", redis.Z{Score: 1, Member: "c"})
-	rdb.ZAdd(ctx, "q:emails:delayed", redis.Z{Score: 1, Member: "d"}, redis.Z{Score: 2, Member: "e"}, redis.Z{Score: 3, Member: "f"})
-	rdb.RPush(ctx, "q:emails:dlq", "g")
+	// Seed known cardinalities; fail loudly if seeding itself errors so a
+	// comparison mismatch can never be misread as a collector bug.
+	mustSeed(t, rdb.ZAdd(ctx, "q:emails:ready", redis.Z{Score: 1, Member: "a"}, redis.Z{Score: 2, Member: "b"}).Err())
+	mustSeed(t, rdb.ZAdd(ctx, "q:emails:inflight", redis.Z{Score: 1, Member: "c"}).Err())
+	mustSeed(t, rdb.ZAdd(ctx, "q:emails:delayed", redis.Z{Score: 1, Member: "d"}, redis.Z{Score: 2, Member: "e"}, redis.Z{Score: 3, Member: "f"}).Err())
+	mustSeed(t, rdb.RPush(ctx, "q:emails:dlq", "g").Err())
 
 	c := metrics.NewDepthCollector(rdb, "emails")
 
