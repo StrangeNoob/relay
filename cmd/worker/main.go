@@ -34,6 +34,8 @@ func main() {
 	promoteInterval := flag.Duration("promote-interval", time.Second, "how often the promoter releases due delayed jobs")
 	backoffBase := flag.Duration("backoff-base", time.Second, "retry backoff base delay")
 	backoffMax := flag.Duration("backoff-max", 10*time.Minute, "retry backoff ceiling")
+	rate := flag.Float64("rate", 0, "max claims/second for this queue (0 = unlimited)")
+	burst := flag.Int("burst", 0, "rate-limit burst capacity (defaults to 1 when --rate is set)")
 	flag.Parse()
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
@@ -52,7 +54,14 @@ func main() {
 		os.Exit(1)
 	}
 
-	b := broker.New(rdb, broker.WithBackoff(*backoffBase, *backoffMax))
+	brokerOpts := []broker.Option{broker.WithBackoff(*backoffBase, *backoffMax)}
+	if *rate > 0 {
+		if *burst < 1 {
+			*burst = 1
+		}
+		brokerOpts = append(brokerOpts, broker.WithRateLimit(*queue, *rate, *burst))
+	}
+	b := broker.New(rdb, brokerOpts...)
 	handler := demoHandler(*failRate, logger)
 
 	var wg sync.WaitGroup

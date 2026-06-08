@@ -26,6 +26,7 @@ type Broker struct {
 	backoffBase time.Duration
 	backoffMax  time.Duration
 	dedupTTL    time.Duration
+	rateLimits  map[string]rateLimit
 
 	rndMu sync.Mutex
 	rnd   *rand.Rand
@@ -211,12 +212,17 @@ func (b *Broker) Enqueue(ctx context.Context, j job.Job, opts ...EnqueueOption) 
 // passed in so the script stays deterministic and tests are not at the mercy of
 // the Redis server clock.
 func (b *Broker) Claim(ctx context.Context, queue string, visibility time.Duration) (job.Job, bool, error) {
+	rate, burst, enabled := 0.0, 0, "0"
+	if rl, ok := b.rateLimits[queue]; ok {
+		rate, burst, enabled = rl.rate, rl.burst, "1"
+	}
+
 	res, err := claimScript.Run(ctx, b.rdb,
-		[]string{readyKey(queue), inflightKey(queue)},
-		time.Now().UnixMilli(), visibility.Milliseconds(), jobKeyPrefix,
+		[]string{readyKey(queue), inflightKey(queue), ratelimitKey(queue)},
+		time.Now().UnixMilli(), visibility.Milliseconds(), jobKeyPrefix, rate, burst, enabled,
 	).Result()
 	if errors.Is(err, redis.Nil) {
-		return job.Job{}, false, nil // nothing ready to claim
+		return job.Job{}, false, nil // nothing ready, or rate-limited
 	}
 	if err != nil {
 		return job.Job{}, false, fmt.Errorf("broker: claiming from %q: %w", queue, err)
