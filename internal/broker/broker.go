@@ -423,6 +423,20 @@ func (b *Broker) ListDLQ(ctx context.Context, queue string, limit, offset int64)
 	return jobs, nil
 }
 
+// RequeueDLQ moves a dead-lettered job back into the ready set for another run,
+// resetting its attempts to 0 (a deliberate operator retry). The move is atomic
+// in requeue.lua. It returns (false, nil) when the id is not in the queue's DLQ.
+func (b *Broker) RequeueDLQ(ctx context.Context, queue, id string) (bool, error) {
+	n, err := requeueScript.Run(ctx, b.rdb,
+		[]string{dlqKey(queue), readyKey(queue)},
+		id, jobKeyPrefix, time.Now().UnixMilli(), priorityScale,
+	).Int()
+	if err != nil {
+		return false, fmt.Errorf("broker: requeuing dlq job %s: %w", id, err)
+	}
+	return n == 1, nil
+}
+
 // hashFromLua converts the flat HGETALL array a script returns (alternating
 // field, value, field, value …) into a Go map. go-redis decodes a Lua table as
 // []interface{} of strings.

@@ -45,3 +45,8 @@ var promoteScript = redis.NewScript(promoteSrc)
 var enqueueSrc string
 
 var enqueueScript = redis.NewScript(enqueueSrc)
+
+//go:embed scripts/requeue.lua
+var requeueSrc string
+
+var requeueScript = redis.NewScript(requeueSrc)

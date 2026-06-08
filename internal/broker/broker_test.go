@@ -1326,3 +1326,50 @@ func TestStatsCountsEachState(t *testing.T) {
 		t.Errorf("DLQ = %d, want 1", s.DLQ)
 	}
 }
+
+func TestRequeueDLQMovesJobBackToReady(t *testing.T) {
+	b, rdb := newTestBroker(t)
+	ctx := context.Background()
+
+	id := deadLetter(t, b, ctx, "emails", "x")
+
+	ok, err := b.RequeueDLQ(ctx, "emails", id)
+	if err != nil {
+		t.Fatalf("RequeueDLQ: %v", err)
+	}
+	if !ok {
+		t.Fatal("RequeueDLQ returned false, want true")
+	}
+
+	if n, _ := rdb.LLen(ctx, "q:emails:dlq").Result(); n != 0 {
+		t.Errorf("dlq len = %d, want 0", n)
+	}
+	if n, _ := rdb.ZCard(ctx, "q:emails:ready").Result(); n != 1 {
+		t.Errorf("ready card = %d, want 1", n)
+	}
+	h, err := rdb.HGetAll(ctx, "job:"+id).Result()
+	if err != nil {
+		t.Fatalf("HGetAll: %v", err)
+	}
+	if h["state"] != "ready" {
+		t.Errorf("state = %q, want ready", h["state"])
+	}
+	if h["attempts"] != "0" {
+		t.Errorf("attempts = %q, want 0", h["attempts"])
+	}
+
+	if _, ok, err := b.Claim(ctx, "emails", time.Minute); err != nil || !ok {
+		t.Fatalf("Claim after requeue: ok=%v err=%v", ok, err)
+	}
+}
+
+func TestRequeueDLQUnknownIDReturnsFalse(t *testing.T) {
+	b, _ := newTestBroker(t)
+	ok, err := b.RequeueDLQ(context.Background(), "emails", "nope")
+	if err != nil {
+		t.Fatalf("RequeueDLQ: %v", err)
+	}
+	if ok {
+		t.Error("RequeueDLQ returned true for an id not in the DLQ, want false")
+	}
+}
