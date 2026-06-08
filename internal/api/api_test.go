@@ -1,6 +1,7 @@
 package api_test
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -9,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/redis/go-redis/v9"
@@ -224,5 +226,52 @@ func TestQueuesEndpointListsNames(t *testing.T) {
 	}
 	if len(names) != 2 || names[0] != "emails" || names[1] != "sms" {
 		t.Errorf("names = %v, want [emails sms]", names)
+	}
+}
+
+func TestStreamEmitsSnapshot(t *testing.T) {
+	h, b, _ := newTestAPI(t)
+	if err := b.Enqueue(context.Background(), mustJob("emails", "x")); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	reqCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	req, _ := http.NewRequestWithContext(reqCtx, http.MethodGet, srv.URL+"/api/stream", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET stream: %v", err)
+	}
+	defer resp.Body.Close()
+	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "text/event-stream") {
+		t.Fatalf("Content-Type = %q, want text/event-stream", ct)
+	}
+
+	reader := bufio.NewReader(resp.Body)
+	var payload string
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			t.Fatalf("reading stream: %v", err)
+		}
+		if strings.HasPrefix(line, "data: ") {
+			payload = strings.TrimSpace(strings.TrimPrefix(line, "data: "))
+			break
+		}
+	}
+	cancel()
+
+	var snaps []map[string]any
+	if err := json.Unmarshal([]byte(payload), &snaps); err != nil {
+		t.Fatalf("decode snapshot %q: %v", payload, err)
+	}
+	if len(snaps) != 1 || snaps[0]["queue"] != "emails" {
+		t.Fatalf("snaps = %v, want one for emails", snaps)
+	}
+	if snaps[0]["ready"].(float64) != 1 {
+		t.Errorf("ready = %v, want 1", snaps[0]["ready"])
 	}
 }
