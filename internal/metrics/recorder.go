@@ -84,31 +84,3 @@ func (r *Recorder) AddPromoted(q string, n int) {
 func (r *Recorder) ObserveLatency(q string, d time.Duration) {
 	r.latency.WithLabelValues(q).Observe(d.Seconds())
 }
-
-// CounterForTest returns the per-queue child counter for the named metric. It
-// exists so tests can read a specific series; "name" is the short key
-// (enqueued, deduped, claimed, processed, retried, dead, reaped, promoted).
-func (r *Recorder) CounterForTest(name, queue string) prometheus.Counter {
-	var v *prometheus.CounterVec
-	switch name {
-	case "enqueued":
-		v = r.enqueued
-	case "deduped":
-		v = r.deduped
-	case "claimed":
-		v = r.claimed
-	case "processed":
-		v = r.processed
-	case "retried":
-		v = r.retried
-	case "dead":
-		v = r.dead
-	case "reaped":
-		v = r.reaped
-	case "promoted":
-		v = r.promoted
-	default:
-		return nil
-	}
-	return v.WithLabelValues(queue)
-}
