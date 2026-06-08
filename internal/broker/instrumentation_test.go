@@ -216,3 +216,59 @@ func TestNackWithBudgetSpentRecordsDead(t *testing.T) {
 		t.Errorf("retried[emails] = %d, want 0", got)
 	}
 }
+
+func TestReapRecordsReapedCount(t *testing.T) {
+	fm := newFakeMetrics()
+	b, _ := newTestBrokerWith(t, broker.WithMetrics(fm))
+	ctx := context.Background()
+
+	// Enqueue + claim two jobs with a tiny visibility so they expire immediately.
+	for i := 0; i < 2; i++ {
+		if err := b.Enqueue(ctx, job.New("emails", []byte("x"))); err != nil {
+			t.Fatalf("Enqueue: %v", err)
+		}
+	}
+	for i := 0; i < 2; i++ {
+		if _, ok, err := b.Claim(ctx, "emails", time.Millisecond); err != nil || !ok {
+			t.Fatalf("Claim: ok=%v err=%v", ok, err)
+		}
+	}
+	time.Sleep(10 * time.Millisecond) // let the visibility deadline pass
+
+	n, err := b.Reap(ctx, "emails")
+	if err != nil {
+		t.Fatalf("Reap: %v", err)
+	}
+	if n != 2 {
+		t.Fatalf("Reap returned %d, want 2", n)
+	}
+	if got := fm.get(fm.reaped, "emails"); got != 2 {
+		t.Errorf("reaped[emails] = %d, want 2", got)
+	}
+}
+
+func TestPromoteRecordsPromotedCount(t *testing.T) {
+	fm := newFakeMetrics()
+	b, _ := newTestBrokerWith(t, broker.WithMetrics(fm))
+	ctx := context.Background()
+
+	// Enqueue two delayed jobs whose ready-at is just in the future, then wait.
+	soon := time.Now().Add(20 * time.Millisecond)
+	for i := 0; i < 2; i++ {
+		if err := b.Enqueue(ctx, job.New("emails", []byte("x")), broker.WithReadyAt(soon)); err != nil {
+			t.Fatalf("Enqueue delayed: %v", err)
+		}
+	}
+	time.Sleep(40 * time.Millisecond)
+
+	n, err := b.Promote(ctx, "emails")
+	if err != nil {
+		t.Fatalf("Promote: %v", err)
+	}
+	if n != 2 {
+		t.Fatalf("Promote returned %d, want 2", n)
+	}
+	if got := fm.get(fm.promoted, "emails"); got != 2 {
+		t.Errorf("promoted[emails] = %d, want 2", got)
+	}
+}

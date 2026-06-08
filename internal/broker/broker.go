@@ -312,6 +312,9 @@ func (b *Broker) Reap(ctx context.Context, queue string) (int, error) {
 	if err != nil {
 		return 0, fmt.Errorf("broker: reaping %q: %w", queue, err)
 	}
+	if n > 0 {
+		b.metrics.AddReaped(queue, n)
+	}
 	return n, nil
 }
 
@@ -326,6 +329,9 @@ func (b *Broker) Promote(ctx context.Context, queue string) (int, error) {
 	).Int()
 	if err != nil {
 		return 0, fmt.Errorf("broker: promoting %q: %w", queue, err)
+	}
+	if n > 0 {
+		b.metrics.AddPromoted(queue, n)
 	}
 	return n, nil
 }
