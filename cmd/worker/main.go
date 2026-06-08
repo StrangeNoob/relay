@@ -12,16 +12,19 @@ import (
 	"fmt"
 	"log/slog"
 	"math/rand"
+	"net/http"
 	"os"
 	"os/signal"
 	"sync"
 	"syscall"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/redis/go-redis/v9"
 
 	"github.com/StrangeNoob/relay/internal/broker"
 	"github.com/StrangeNoob/relay/internal/job"
+	"github.com/StrangeNoob/relay/internal/metrics"
 	"github.com/StrangeNoob/relay/internal/worker"
 )
 
@@ -36,6 +39,7 @@ func main() {
 	backoffMax := flag.Duration("backoff-max", 10*time.Minute, "retry backoff ceiling")
 	rate := flag.Float64("rate", 0, "max claims/second for this queue (0 = unlimited)")
 	burst := flag.Int("burst", 0, "rate-limit burst capacity (defaults to 1 when --rate is set)")
+	metricsAddr := flag.String("metrics-addr", "", "address to serve Prometheus /metrics on (e.g. :9090); empty = disabled")
 	flag.Parse()
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
@@ -61,7 +65,32 @@ func main() {
 		}
 		brokerOpts = append(brokerOpts, broker.WithRateLimit(*queue, *rate, *burst))
 	}
+
+	// Metrics: build recorder and register a depth collector only when
+	// --metrics-addr is set; otherwise rec stays nil and all metric paths
+	// are skipped, preserving byte-identical behaviour to before.
+	var rec *metrics.Recorder
+	if *metricsAddr != "" {
+		rec = metrics.NewRecorder()
+		rec.Registry().MustRegister(metrics.NewDepthCollector(rdb, *queue))
+		brokerOpts = append(brokerOpts, broker.WithMetrics(rec))
+	}
+
 	b := broker.New(rdb, brokerOpts...)
+	// Start the Prometheus metrics HTTP server when --metrics-addr is set.
+	var metricsSrv *http.Server
+	if rec != nil {
+		mux := http.NewServeMux()
+		mux.Handle("/metrics", promhttp.HandlerFor(rec.Registry(), promhttp.HandlerOpts{}))
+		metricsSrv = &http.Server{Addr: *metricsAddr, Handler: mux}
+		go func() {
+			logger.Info("metrics server listening", "addr", *metricsAddr)
+			if err := metricsSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				logger.Error("metrics server error", "err", err)
+			}
+		}()
+	}
+
 	handler := demoHandler(*failRate, logger)
 
 	var wg sync.WaitGroup
@@ -98,6 +127,17 @@ func main() {
 	<-ctx.Done()
 	logger.Info("shutdown signal received, draining in-flight jobs")
 	wg.Wait()
+
+	// Shut down the metrics server after all workers have drained, so the
+	// final scrape can still observe counters from the last batch of jobs.
+	if metricsSrv != nil {
+		shutCtx, shutCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer shutCancel()
+		if err := metricsSrv.Shutdown(shutCtx); err != nil {
+			logger.Error("metrics server shutdown error", "err", err)
+		}
+	}
+
 	logger.Info("relay worker stopped cleanly")
 }
 
