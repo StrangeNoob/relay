@@ -381,6 +381,48 @@ func (b *Broker) Stats(ctx context.Context, queue string) (Stats, error) {
 	}, nil
 }
 
+// DLQ listing bounds: an unset/zero limit uses the default; the max caps a single
+// page so a huge DLQ cannot be slurped in one request.
+const (
+	defaultDLQLimit = 50
+	maxDLQLimit     = 1000
+)
+
+// ListDLQ returns up to limit dead-lettered jobs for a queue, starting at offset
+// (0-based) in insertion order. A limit <= 0 uses the default; limits above the
+// max are clamped. Job ids whose hash has already been removed are skipped.
+func (b *Broker) ListDLQ(ctx context.Context, queue string, limit, offset int64) ([]job.Job, error) {
+	if limit <= 0 {
+		limit = defaultDLQLimit
+	}
+	if limit > maxDLQLimit {
+		limit = maxDLQLimit
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	ids, err := b.rdb.LRange(ctx, dlqKey(queue), offset, offset+limit-1).Result()
+	if err != nil {
+		return nil, fmt.Errorf("broker: listing dlq for %q: %w", queue, err)
+	}
+	jobs := make([]job.Job, 0, len(ids))
+	for _, id := range ids {
+		h, err := b.rdb.HGetAll(ctx, jobKey(id)).Result()
+		if err != nil {
+			return nil, fmt.Errorf("broker: loading dlq job %s: %w", id, err)
+		}
+		if len(h) == 0 {
+			continue // hash already cleaned up; skip
+		}
+		j, err := job.FromHash(h)
+		if err != nil {
+			return nil, fmt.Errorf("broker: decoding dlq job %s: %w", id, err)
+		}
+		jobs = append(jobs, j)
+	}
+	return jobs, nil
+}
+
 // hashFromLua converts the flat HGETALL array a script returns (alternating
 // field, value, field, value …) into a Go map. go-redis decodes a Lua table as
 // []interface{} of strings.

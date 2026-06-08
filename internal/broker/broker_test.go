@@ -1216,6 +1216,73 @@ func TestRateLimitConcurrentClaimsRespectBurst(t *testing.T) {
 	}
 }
 
+// deadLetter enqueues a job with no retry budget, claims it, and nacks it so it
+// lands in the DLQ; it returns the dead-lettered job's id.
+func deadLetter(t *testing.T, b *broker.Broker, ctx context.Context, queue, payload string) string {
+	t.Helper()
+	j := job.New(queue, []byte(payload))
+	j.MaxRetries = 0
+	if err := b.Enqueue(ctx, j); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	claimed, ok, err := b.Claim(ctx, queue, time.Minute)
+	if err != nil || !ok {
+		t.Fatalf("Claim: ok=%v err=%v", ok, err)
+	}
+	if err := b.Nack(ctx, claimed); err != nil {
+		t.Fatalf("Nack: %v", err)
+	}
+	return claimed.ID
+}
+
+func TestListDLQReturnsDeadJobs(t *testing.T) {
+	b, _ := newTestBroker(t)
+	ctx := context.Background()
+
+	id1 := deadLetter(t, b, ctx, "emails", "a")
+	id2 := deadLetter(t, b, ctx, "emails", "b")
+
+	jobs, err := b.ListDLQ(ctx, "emails", 0, 0)
+	if err != nil {
+		t.Fatalf("ListDLQ: %v", err)
+	}
+	if len(jobs) != 2 {
+		t.Fatalf("len = %d, want 2", len(jobs))
+	}
+	if jobs[0].ID != id1 || jobs[1].ID != id2 {
+		t.Errorf("ids = %s,%s want %s,%s", jobs[0].ID, jobs[1].ID, id1, id2)
+	}
+	if jobs[0].State != job.StateDead {
+		t.Errorf("state = %q, want dead", jobs[0].State)
+	}
+}
+
+func TestListDLQPaginates(t *testing.T) {
+	b, _ := newTestBroker(t)
+	ctx := context.Background()
+	for i := 0; i < 3; i++ {
+		deadLetter(t, b, ctx, "emails", "x")
+	}
+	page, err := b.ListDLQ(ctx, "emails", 2, 1) // limit 2, offset 1 -> items 2 and 3
+	if err != nil {
+		t.Fatalf("ListDLQ: %v", err)
+	}
+	if len(page) != 2 {
+		t.Errorf("len = %d, want 2", len(page))
+	}
+}
+
+func TestListDLQEmpty(t *testing.T) {
+	b, _ := newTestBroker(t)
+	jobs, err := b.ListDLQ(context.Background(), "emails", 0, 0)
+	if err != nil {
+		t.Fatalf("ListDLQ: %v", err)
+	}
+	if len(jobs) != 0 {
+		t.Errorf("len = %d, want 0", len(jobs))
+	}
+}
+
 func TestStatsCountsEachState(t *testing.T) {
 	b, rdb := newTestBroker(t)
 	ctx := context.Background()
