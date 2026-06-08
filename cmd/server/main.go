@@ -20,6 +20,7 @@ import (
 	"github.com/StrangeNoob/relay/internal/api"
 	"github.com/StrangeNoob/relay/internal/broker"
 	"github.com/StrangeNoob/relay/internal/metrics"
+	"github.com/StrangeNoob/relay/web"
 )
 
 func main() {
@@ -56,6 +57,9 @@ func main() {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
 	})
+	// Serve the embedded dashboard at / (SPA fallback). Registered last and at the
+	// root, so the more specific /api/, /metrics, /healthz patterns take priority.
+	mux.Handle("/", web.Handler())
 
 	srv := &http.Server{Addr: *addr, Handler: mux}
 	go func() {
