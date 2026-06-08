@@ -61,10 +61,10 @@ were always out of scope. Repo: <https://github.com/StrangeNoob/relay>. What exi
   (format helpers, series builders) and a snapshot test. `web/` has its own `package.json`; the
   Go module gains no dependency.
 - `Dockerfile` — multi-stage distroless image; builds all three binaries (`cmd/server`,
-  `cmd/worker`, `cmd/demo`) from a single image tagged `relay:latest`.
-- `deployments/docker-compose.yml` — redis + server + scalable workers (3 replicas) + one-shot
-  demo; `docker compose up --build` brings up a fully working end-to-end stack (dashboard at `/`,
-  `/healthz`, `/metrics` all functional).
+  `cmd/worker`, `cmd/demo`) into one shared image (compose tags it `relay:local`).
+- `deployments/docker-compose.yml` — redis + server + worker (1 by default, scale with
+  `--scale worker=N`) + one-shot demo; `docker compose up --build` brings up a fully working
+  end-to-end stack (dashboard at `/`, `/healthz`, `/metrics` all functional).
 - `README.md` — portfolio front page with Mermaid architecture diagram, feature list, quickstart
   (native + Docker), and deploy notes.
 - `.github/workflows/ci.yml` — Redis service + `go test -race` + `golangci-lint` + dashboard
