@@ -155,9 +155,11 @@ Use `internal/` for everything not meant as a public import surface. `cmd/` hold
   - `github.com/redis/go-redis/v9` — a Redis *driver*, not a queue library.
   - `github.com/prometheus/client_golang` — a metrics instrumentation library, not a queue library.
   Neither violates the "build the queue from scratch on Redis" rule. The queue logic is ours.
-- **Tests need a real Redis** at `localhost:6379` (override with `REDIS_ADDR`). They use **DB 15**
-  and `FlushDB` per test, and **skip** (not fail) when Redis is unreachable — so a green local run
-  with no Redis means the broker/worker suites were skipped. CI provides a Redis service.
+- **Tests need a real Redis** at `localhost:6379` (override with `REDIS_ADDR`). Each Redis-using
+  package claims its own logical DB so `go test ./...` runs them in parallel without flushing each
+  other (broker → **DB 15**, worker → **DB 14**, metrics → **DB 13**; a new one picks another), with
+  `FlushDB` per test, and they **skip** (not fail) when Redis is unreachable — so a green local run
+  with no Redis means those suites were skipped. CI provides a Redis service.
 
 ```sh
 go build ./...
