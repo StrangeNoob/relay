@@ -254,6 +254,8 @@ func (b *Broker) Ack(ctx context.Context, j job.Job) error {
 	).Err(); err != nil {
 		return fmt.Errorf("broker: acking job %s: %w", j.ID, err)
 	}
+	b.metrics.IncProcessed(j.Queue)
+	b.metrics.ObserveLatency(j.Queue, time.Since(j.CreatedAt))
 	return nil
 }
 

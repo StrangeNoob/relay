@@ -132,3 +132,36 @@ func TestClaimEmptyQueueRecordsNothing(t *testing.T) {
 		t.Errorf("claimed[emails] = %d, want 0", got)
 	}
 }
+
+func TestAckRecordsProcessedAndLatency(t *testing.T) {
+	fm := newFakeMetrics()
+	b, _ := newTestBrokerWith(t, broker.WithMetrics(fm))
+	ctx := context.Background()
+
+	if err := b.Enqueue(ctx, job.New("emails", []byte("x"))); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	j, ok, err := b.Claim(ctx, "emails", time.Minute)
+	if err != nil || !ok {
+		t.Fatalf("Claim: ok=%v err=%v", ok, err)
+	}
+	if err := b.Ack(ctx, j); err != nil {
+		t.Fatalf("Ack: %v", err)
+	}
+	if got := fm.get(fm.processed, "emails"); got != 1 {
+		t.Errorf("processed[emails] = %d, want 1", got)
+	}
+	fm.mu.Lock()
+	n := len(fm.latencies)
+	var d time.Duration
+	if n == 1 {
+		d = fm.latencies[0]
+	}
+	fm.mu.Unlock()
+	if n != 1 {
+		t.Fatalf("latencies len = %d, want 1", n)
+	}
+	if d < 0 {
+		t.Errorf("latency = %v, want non-negative", d)
+	}
+}
