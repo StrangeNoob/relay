@@ -10,12 +10,13 @@ project: the point is to *prove understanding of queue internals*, not to wrap a
 library. Do not introduce a queue dependency (BullMQ, asynq, Machinery, Celery, etc.) — the
 mechanics are the deliverable.
 
-**Status: Phase 1 complete; Phase 2 complete; Phase 3 in progress — 3a (HTTP API + server) ✅,
-3b (dashboard) ✅, 3c (producer SDK) ✅ done.** The core engine plus delayed jobs, the promoter,
-retry backoff, priority, idempotency enforcement, per-queue rate limiting, Prometheus metrics, the
-JSON REST API + server, the embedded React dashboard, and the stdlib-only HTTP producer SDK are
-built, tested against a real Redis under `-race`, and CI is green. Only packaging/deploy (3d)
-remains. Repo: <https://github.com/StrangeNoob/relay>. What exists today:
+**Status: Phases 1–3 complete.** 3a (HTTP API + server) ✅, 3b (dashboard) ✅, 3c (producer SDK)
+✅, 3d (packaging/deploy/README) ✅. The core engine plus delayed jobs, the promoter, retry
+backoff, priority, idempotency enforcement, per-queue rate limiting, Prometheus metrics, the JSON
+REST API + server, the embedded React dashboard, the stdlib-only HTTP producer SDK, and the
+Docker/Compose packaging are all built, tested against a real Redis under `-race`, and CI is
+green. Only "Future work" items (Postgres SKIP LOCKED mode, exactly-once outbox) remain, which
+were always out of scope. Repo: <https://github.com/StrangeNoob/relay>. What exists today:
 
 - `internal/job` — the `Job` model + Redis-hash encoding (`ToHash`/`FromHash`).
 - `internal/broker` — `Enqueue` (with `WithDelay`/`WithReadyAt`/`WithPriority`/`WithIdempotencyKey` options), atomic `Claim`, `Ack`,
@@ -59,10 +60,15 @@ remains. Repo: <https://github.com/StrangeNoob/relay>. What exists today:
   `cmd/server` with SPA index.html fallback). Includes vitest unit tests for pure logic
   (format helpers, series builders) and a snapshot test. `web/` has its own `package.json`; the
   Go module gains no dependency.
+- `Dockerfile` — multi-stage distroless image; builds all three binaries (`cmd/server`,
+  `cmd/worker`, `cmd/demo`) from a single image tagged `relay:latest`.
+- `deployments/docker-compose.yml` — redis + server + scalable workers (3 replicas) + one-shot
+  demo; `docker compose up --build` brings up a fully working end-to-end stack (dashboard at `/`,
+  `/healthz`, `/metrics` all functional).
+- `README.md` — portfolio front page with Mermaid architecture diagram, feature list, quickstart
+  (native + Docker), and deploy notes.
 - `.github/workflows/ci.yml` — Redis service + `go test -race` + `golangci-lint` + dashboard
-  build/typecheck/test/dist-sync check.
-
-Packaging/deploy (3d) is **not** built yet.
+  build/typecheck/test/dist-sync check + `docker build` job.
 
 ## Source of truth
 
@@ -106,6 +112,7 @@ spec disagree, the spec wins until the spec is deliberately updated.
 - **Committed `web/dist` must be rebuilt on UI change.** The Go binary embeds the committed dist; CI has a `git diff --exit-code -- dist` step to catch stale builds. Run `cd web && npm run build` and commit the updated dist whenever source changes.
 - **Producer SDK does no client-side retries.** `internal/client` makes one HTTP request per call; transient failures are surfaced as errors. The caller is responsible for retry logic (with backoff) if needed.
 - **`cmd/demo` requires a running `cmd/server`.** The demo load generator now produces jobs through the HTTP SDK (`-server` flag) and no longer talks to Redis directly. Running `cmd/demo` without `cmd/server` will produce connection errors immediately.
+- **Docker/Compose packaging notes.** The compose Redis has no volume mount — data is ephemeral and lost on `docker compose down`. The `demo` service is one-shot (exits after enqueuing); workers and server continue running. The distroless image has no shell (`/bin/sh` is absent), so `docker exec` interactive debugging is not available. Deploying to a live environment (Railway, Fly.io, etc.) is the operator's step; the compose stack is a local demo, not a production-hardened deployment.
 
 ## Redis data model & job lifecycle (the architecture in brief)
 
@@ -162,8 +169,10 @@ internal/metrics/                  # ✅ Prometheus Recorder + DepthCollector
 internal/api/                      # ✅ JSON REST API handler (Phase 3a)
 internal/client/                   # ✅ stdlib-only HTTP producer SDK (Phase 3c)
 web/                               # ✅ Vite+React dashboard + web/embed.go (Phase 3b)
-deployments/docker-compose.yml     # ◻ redis + server + N workers + demo (Phase 3d)
-.github/workflows/ci.yml           # ✅ Redis service + go test -race + golangci-lint + dashboard CI
+Dockerfile                         # ✅ multi-stage distroless image (Phase 3d)
+deployments/docker-compose.yml     # ✅ redis + server + N workers + demo (Phase 3d)
+README.md                          # ✅ portfolio front page with diagram + quickstart (Phase 3d)
+.github/workflows/ci.yml           # ✅ Redis service + go test -race + golangci-lint + dashboard CI + docker build
 ```
 
 Use `internal/` for everything not meant as a public import surface. `cmd/` holds only thin
@@ -173,7 +182,7 @@ Use `internal/` for everything not meant as a public import surface. `cmd/` hold
 
 1. **Phase 1 — core: ✅ done.** job model; enqueue/claim/ack/nack Lua; reaper; worker runtime; basic DLQ; integration tests; CI. A working, testable queue ships first.
 2. **Phase 2 — depth: ✅ done.** delayed jobs + promoter ✅; backoff + jitter ✅; priority ✅; idempotency ✅; rate limiting ✅; Prometheus metrics ✅.
-3. **Phase 3 — polish (in progress):** 3a HTTP API + server ✅; 3b dashboard ✅; 3c producer SDK (`internal/client`) ✅; 3d docker-compose + deployed demo + README diagram.
+3. **Phase 3 — polish: ✅ done.** 3a HTTP API + server ✅; 3b dashboard ✅; 3c producer SDK (`internal/client`) ✅; 3d Dockerfile + docker-compose + README ✅.
 4. **Future work (NOT now):** Postgres-backed (`SKIP LOCKED`) mode; exactly-once via consumer outbox.
 
 ## Conventions
@@ -223,6 +232,8 @@ go run ./cmd/demo   -server http://localhost:8080 -queue demo -count 100  # enqu
 
 # frontend dev/test (requires Node 20+):
 cd web && npm ci && npm run typecheck && npm run test && npm run build
-```
 
-Keep this section updated as the Makefile / docker-compose take shape.
+# Docker quickstart (all-in-one):
+docker compose -f deployments/docker-compose.yml up --build
+# then open http://localhost:8080 — dashboard, /healthz, and /metrics all available
+```
