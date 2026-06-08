@@ -1061,3 +1061,107 @@ func TestConcurrentEnqueueSameKeyDeduplicates(t *testing.T) {
 		t.Errorf("ready size = %d, want exactly 1", c)
 	}
 }
+
+func TestRateLimitBurstThenDeny(t *testing.T) {
+	_, rdb := newTestBroker(t)
+	ctx := context.Background()
+	b := broker.New(rdb, broker.WithRateLimit("emails", 1, 2)) // 1/s, burst 2
+
+	for i := 0; i < 5; i++ {
+		if err := b.Enqueue(ctx, job.New("emails", []byte("x"))); err != nil {
+			t.Fatalf("Enqueue: %v", err)
+		}
+	}
+	for i := 0; i < 2; i++ {
+		if _, ok, err := b.Claim(ctx, "emails", time.Minute); err != nil || !ok {
+			t.Fatalf("claim %d: err=%v ok=%v, want a job", i, err, ok)
+		}
+	}
+	if _, ok, err := b.Claim(ctx, "emails", time.Minute); err != nil {
+		t.Fatalf("claim 3: %v", err)
+	} else if ok {
+		t.Error("third claim returned a job, want rate-limited (ok=false)")
+	}
+	if n, _ := rdb.ZCard(ctx, "q:emails:ready").Result(); n != 3 {
+		t.Errorf("ready = %d, want 3 (only 2 popped)", n)
+	}
+	if n, _ := rdb.ZCard(ctx, "q:emails:inflight").Result(); n != 2 {
+		t.Errorf("inflight = %d, want 2", n)
+	}
+}
+
+func TestRateLimitFreshQueueStartsFull(t *testing.T) {
+	_, rdb := newTestBroker(t)
+	ctx := context.Background()
+	b := broker.New(rdb, broker.WithRateLimit("emails", 1, 3)) // burst 3
+
+	for i := 0; i < 4; i++ {
+		if err := b.Enqueue(ctx, job.New("emails", []byte("x"))); err != nil {
+			t.Fatalf("Enqueue: %v", err)
+		}
+	}
+	for i := 0; i < 3; i++ {
+		if _, ok, err := b.Claim(ctx, "emails", time.Minute); err != nil || !ok {
+			t.Fatalf("claim %d: err=%v ok=%v, want a job (full burst)", i, err, ok)
+		}
+	}
+	if _, ok, _ := b.Claim(ctx, "emails", time.Minute); ok {
+		t.Error("4th claim succeeded, want denied (burst exhausted)")
+	}
+}
+
+func TestRateLimitConsumeOnlyOnPop(t *testing.T) {
+	_, rdb := newTestBroker(t)
+	ctx := context.Background()
+	b := broker.New(rdb, broker.WithRateLimit("emails", 1, 1)) // burst 1
+
+	for i := 0; i < 5; i++ {
+		if _, ok, err := b.Claim(ctx, "emails", time.Minute); err != nil {
+			t.Fatalf("empty claim %d: %v", i, err)
+		} else if ok {
+			t.Fatalf("empty claim %d returned a job", i)
+		}
+	}
+	if err := b.Enqueue(ctx, job.New("emails", []byte("x"))); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if _, ok, err := b.Claim(ctx, "emails", time.Minute); err != nil || !ok {
+		t.Fatalf("claim after empty polls: err=%v ok=%v, want a job (bucket not drained)", err, ok)
+	}
+}
+
+func TestRateLimitRefillOverTime(t *testing.T) {
+	_, rdb := newTestBroker(t)
+	ctx := context.Background()
+	b := broker.New(rdb, broker.WithRateLimit("emails", 100, 1)) // 100/s → 10ms/token, burst 1
+
+	for i := 0; i < 3; i++ {
+		if err := b.Enqueue(ctx, job.New("emails", []byte("x"))); err != nil {
+			t.Fatalf("Enqueue: %v", err)
+		}
+	}
+	if _, ok, err := b.Claim(ctx, "emails", time.Minute); err != nil || !ok {
+		t.Fatalf("claim 1: err=%v ok=%v", err, ok)
+	}
+	if _, ok, _ := b.Claim(ctx, "emails", time.Minute); ok {
+		t.Error("claim 2 immediately succeeded, want denied")
+	}
+	time.Sleep(30 * time.Millisecond) // refills ~3 tokens, capped at burst 1
+	if _, ok, err := b.Claim(ctx, "emails", time.Minute); err != nil || !ok {
+		t.Fatalf("claim 3 after refill: err=%v ok=%v, want a job", err, ok)
+	}
+}
+
+func TestClaimUnlimitedCreatesNoBucket(t *testing.T) {
+	b, rdb := newTestBroker(t) // no rate limit configured
+	ctx := context.Background()
+	if err := b.Enqueue(ctx, job.New("emails", []byte("x"))); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if _, ok, err := b.Claim(ctx, "emails", time.Minute); err != nil || !ok {
+		t.Fatalf("Claim: err=%v ok=%v", err, ok)
+	}
+	if n, _ := rdb.Exists(ctx, "q:emails:ratelimit").Result(); n != 0 {
+		t.Errorf("ratelimit bucket created for an unlimited queue")
+	}
+}
