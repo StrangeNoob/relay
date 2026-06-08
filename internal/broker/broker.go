@@ -277,6 +277,8 @@ func (b *Broker) Nack(ctx context.Context, j job.Job) error {
 	if err != nil {
 		return fmt.Errorf("broker: nacking job %s: %w", j.ID, err)
 	}
+	// nack.lua returns "retry" or "dead"; any other value intentionally records
+	// nothing rather than mis-attributing a count.
 	switch outcome {
 	case "retry":
 		b.metrics.IncRetried(j.Queue)
