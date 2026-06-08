@@ -88,6 +88,15 @@ func dlqKey(queue string) string { return "q:" + queue + ":dlq" }
 // ZSET scored by each job's ready-at time. The promoter scans it.
 func delayedKey(queue string) string { return "q:" + queue + ":delayed" }
 
+// processedKey is the Redis key for a queue's cumulative processed counter:
+// `q:{name}:processed`, INCR'd by ack.lua. Read by the dashboard for throughput.
+func processedKey(queue string) string { return "q:" + queue + ":processed" }
+
+// deadKey is the Redis key for a queue's cumulative dead-letter counter:
+// `q:{name}:dead`, INCR'd by nack.lua on the dead branch. Read by the dashboard
+// to show total dead-lettered jobs without scanning the DLQ list.
+func deadKey(queue string) string { return "q:" + queue + ":dead" }
+
 // enqueueConfig holds resolved enqueue options. A zero readyAt means "now".
 type enqueueConfig struct {
 	readyAt           time.Time
@@ -251,7 +260,7 @@ func (b *Broker) Claim(ctx context.Context, queue string, visibility time.Durati
 // as one Lua script (ack.lua).
 func (b *Broker) Ack(ctx context.Context, j job.Job) error {
 	if err := ackScript.Run(ctx, b.rdb,
-		[]string{inflightKey(j.Queue)},
+		[]string{inflightKey(j.Queue), processedKey(j.Queue)},
 		j.ID, jobKeyPrefix,
 	).Err(); err != nil {
 		return fmt.Errorf("broker: acking job %s: %w", j.ID, err)
@@ -273,7 +282,7 @@ func (b *Broker) Nack(ctx context.Context, j job.Job) error {
 	readyAt := time.Now().Add(delay).UnixMilli()
 
 	outcome, err := nackScript.Run(ctx, b.rdb,
-		[]string{inflightKey(j.Queue), delayedKey(j.Queue), dlqKey(j.Queue)},
+		[]string{inflightKey(j.Queue), delayedKey(j.Queue), dlqKey(j.Queue), deadKey(j.Queue)},
 		j.ID, jobKeyPrefix, readyAt,
 	).Text()
 	if err != nil {
@@ -381,6 +390,44 @@ func (b *Broker) Stats(ctx context.Context, queue string) (Stats, error) {
 		Delayed:  delayed.Val(),
 		DLQ:      dlq.Val(),
 	}, nil
+}
+
+// Counters is a queue's cumulative, monotonic lifetime totals — distinct from the
+// point-in-time depths in Stats. They back the dashboard's throughput rate.
+type Counters struct {
+	Processed int64 `json:"processed_total"`
+	Dead      int64 `json:"dead_total"`
+}
+
+// Counters reads a queue's processed/dead counters in one pipeline. A missing
+// key (queue never acked/dead-lettered) reads as 0, not an error.
+func (b *Broker) Counters(ctx context.Context, queue string) (Counters, error) {
+	pipe := b.rdb.Pipeline()
+	pCmd := pipe.Get(ctx, processedKey(queue))
+	dCmd := pipe.Get(ctx, deadKey(queue))
+	// A GET on a missing key yields redis.Nil, which Exec surfaces as an error;
+	// that is expected here, so only a non-Nil error is a real failure.
+	if _, err := pipe.Exec(ctx); err != nil && !errors.Is(err, redis.Nil) {
+		return Counters{}, fmt.Errorf("broker: counters for %q: %w", queue, err)
+	}
+	processed, err := getInt64OrZero(pCmd)
+	if err != nil {
+		return Counters{}, fmt.Errorf("broker: counters for %q: %w", queue, err)
+	}
+	dead, err := getInt64OrZero(dCmd)
+	if err != nil {
+		return Counters{}, fmt.Errorf("broker: counters for %q: %w", queue, err)
+	}
+	return Counters{Processed: processed, Dead: dead}, nil
+}
+
+// getInt64OrZero reads a GET result as int64, treating a missing key as 0.
+func getInt64OrZero(cmd *redis.StringCmd) (int64, error) {
+	v, err := cmd.Int64()
+	if errors.Is(err, redis.Nil) {
+		return 0, nil
+	}
+	return v, err
 }
 
 // DLQ listing bounds: an unset/zero limit uses the default; the max caps a single

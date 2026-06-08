@@ -10,20 +10,22 @@ project: the point is to *prove understanding of queue internals*, not to wrap a
 library. Do not introduce a queue dependency (BullMQ, asynq, Machinery, Celery, etc.) — the
 mechanics are the deliverable.
 
-**Status: Phase 1 complete; Phase 2 complete; Phase 3 in progress — 3a (HTTP API + server) ✅
-done.** The core engine plus delayed jobs, the promoter, retry backoff, priority, idempotency
-enforcement, per-queue rate limiting, Prometheus metrics, and the JSON REST API + server are
-built, tested against a real Redis under `-race`, and CI is green. Dashboard (3b), producer SDK
-(3c), and packaging/deploy (3d) remain. Repo: <https://github.com/StrangeNoob/relay>. What
-exists today:
+**Status: Phase 1 complete; Phase 2 complete; Phase 3 in progress — 3a (HTTP API + server) ✅,
+3b (dashboard) ✅ done.** The core engine plus delayed jobs, the promoter, retry backoff, priority,
+idempotency enforcement, per-queue rate limiting, Prometheus metrics, the JSON REST API + server,
+and the embedded React dashboard are built, tested against a real Redis under `-race`, and CI is
+green. Producer SDK (3c) and packaging/deploy (3d) remain. Repo: <https://github.com/StrangeNoob/relay>.
+What exists today:
 
 - `internal/job` — the `Job` model + Redis-hash encoding (`ToHash`/`FromHash`).
 - `internal/broker` — `Enqueue` (with `WithDelay`/`WithReadyAt`/`WithPriority`/`WithIdempotencyKey` options), atomic `Claim`, `Ack`,
   `Nack` (full-jitter backoff via the delayed set), `Reap`, `Promote`, `Extend` (heartbeat),
   `Stats` (ZCARD/LLEN snapshot per queue), `ListDLQ` (paged DLQ inspection), `RequeueDLQ`
-  (atomic dlq→ready reset via `requeue.lua`), `Queues` (SCAN-based queue discovery), with
-  Lua under `internal/broker/scripts/`: `enqueue.lua`, `claim.lua`, `ack.lua`, `nack.lua`,
-  `reaper.lua`, `promote.lua`, `heartbeat.lua`, `requeue.lua`. Broker options: `WithBackoff`,
+  (atomic dlq→ready reset via `requeue.lua`), `Queues` (SCAN-based queue discovery),
+  `Counters(ctx, queue)` (reads `q:{name}:processed` and `q:{name}:dead` cumulative counters), with
+  Lua under `internal/broker/scripts/`: `enqueue.lua`, `claim.lua`, `ack.lua` (INCRs
+  `q:{name}:processed`), `nack.lua` (INCRs `q:{name}:dead` on dead-letter), `reaper.lua`,
+  `promote.lua`, `heartbeat.lua`, `requeue.lua`. Broker options: `WithBackoff`,
   `WithDedupTTL`, `WithRateLimit(queue, rate, burst)` (token-bucket per-queue rate limiting via
   Redis hash), `WithMetrics(m)` (installs a `broker.Metrics` implementation; default is a no-op).
 - `internal/metrics` — Prometheus `Recorder` (implements `broker.Metrics`; counters
@@ -35,16 +37,25 @@ exists today:
 - `internal/api` — JSON REST API over stdlib `net/http` (Go 1.22 method+path routing). Endpoints:
   `POST /api/queues/{queue}/jobs` (enqueue; 409 on idempotency dup), `GET /api/queues/{queue}/stats`,
   `GET /api/queues/{queue}/dlq?limit=&offset=`, `POST /api/queues/{queue}/dlq/{id}/requeue`
-  (404 if not in DLQ), `GET /api/queues`. Constructed via `api.New(b, logger) http.Handler`.
+  (404 if not in DLQ), `GET /api/queues`, `GET /api/stream` (SSE; pushes per-queue depth +
+  `processed`/`dead` counters to every connected dashboard every ~1 s; implemented in
+  `internal/api/stream.go`). Constructed via `api.New(b, logger) http.Handler`.
 - `cmd/worker`, `cmd/demo` — thin runnable entrypoints (worker pool + reaper + promoter; load
   generator with `--delay`). `cmd/worker` accepts `--metrics-addr` (default "" = off); when set,
   serves `/metrics` and registers the depth collector with graceful shutdown.
 - `cmd/server` — wires Redis + broker (with a `metrics.Recorder` so API enqueues are counted) +
-  the API handler + `/metrics` + `/healthz`; graceful shutdown on SIGINT/SIGTERM. Flags: `-addr`,
-  `-redis`, `-queues` (comma-separated queues for the depth collector).
-- `.github/workflows/ci.yml` — Redis service + `go test -race` + `golangci-lint`.
+  the API handler + `/metrics` + `/healthz` + embedded dashboard at `/`; graceful shutdown on
+  SIGINT/SIGTERM. Flags: `-addr`, `-redis`, `-queues` (comma-separated queues for the depth
+  collector).
+- `web/` — Vite+React+TypeScript dark-editorial dashboard. Source under `web/src/`; production
+  build committed to `web/dist/` (embedded via `web/embed.go` using `go:embed`, served at `/` by
+  `cmd/server` with SPA index.html fallback). Includes vitest unit tests for pure logic
+  (format helpers, series builders) and a snapshot test. `web/` has its own `package.json`; the
+  Go module gains no dependency.
+- `.github/workflows/ci.yml` — Redis service + `go test -race` + `golangci-lint` + dashboard
+  build/typecheck/test/dist-sync check.
 
-Dashboard (3b), producer SDK (3c), and packaging/deploy (3d) are **not** built yet.
+Producer SDK (3c) and packaging/deploy (3d) are **not** built yet.
 
 ## Source of truth
 
@@ -83,6 +94,9 @@ spec disagree, the spec wins until the spec is deliberately updated.
 - **Rate-limit config is per-worker, not stored in Redis.** All workers on a queue must register the same `WithRateLimit` (they share one Redis bucket and pass rate/burst on every claim); mismatched configs refill inconsistently. A rate-limited claim is indistinguishable from an empty queue to the worker (it polls again).
 - **Metrics are per-process and opt-in.** `broker.WithMetrics` installs a Prometheus recorder (default is a no-op); `cmd/worker --metrics-addr` serves `/metrics`. Counters/latency are per worker process — aggregate across workers in Prometheus. Queue-depth gauges read shared Redis at scrape time (one round-trip per queue/state), so every worker reports the same depths (aggregate with max/avg, not sum). Label cardinality is per queue. `cmd/server` also exposes `/metrics`; depth gauges there cover only the queues listed in `-queues` at startup.
 - **HTTP API is demo-grade, no auth.** The API server has no authentication or authorization layer. Payloads are treated as UTF-8 strings (base64 encoding for binary payloads is a future addition). DLQ paging is offset/limit (no cursor). `Queues` discovery uses Redis SCAN (eventually-consistent) and sorts results in Go.
+- **Dashboard charts are in-memory rolling windows.** The client-side time-series buffer resets on page reload; there is no server-side history. `processed`/`dead` counters are monotonic Redis INCRs (no reset); the dashboard derives a rate by differencing successive SSE snapshots.
+- **SSE is per-connection.** Each open dashboard tab runs its own server-side ticker goroutine reading Redis every ~1 s. This is fine for a demo; a production deployment would fan-out from a single poller.
+- **Committed `web/dist` must be rebuilt on UI change.** The Go binary embeds the committed dist; CI has a `git diff --exit-code -- dist` step to catch stale builds. Run `cd web && npm run build` and commit the updated dist whenever source changes.
 
 ## Redis data model & job lifecycle (the architecture in brief)
 
@@ -99,6 +113,8 @@ and the whole engine follows:
 | `q:{name}:delayed` | ZSET | ready-at ts | scheduled + backoff jobs; **promoter scans this** and moves due ones (`ready-at ≤ now`) to `ready` |
 | `q:{name}:dedup:{key}` | string | — | per-key string with TTL; **enqueue dedup** — a keyed duplicate is dropped with ErrDuplicate |
 | `q:{name}:ratelimit` | hash | — | per-queue token bucket (`tokens`, `ts`); claim consumes a token only on a successful pop |
+| `q:{name}:processed` | string | — | cumulative INCR on every `ack`; read by `Counters` + SSE stream to back dashboard throughput display |
+| `q:{name}:dead` | string | — | cumulative INCR when a job is dead-lettered (in `nack.lua`); read by `Counters` + SSE stream |
 
 States in use today: `pending` (constructed, not enqueued), `ready`, `inflight`, `delayed`
 (scheduled or waiting out a backoff), `dead`.
@@ -119,7 +135,9 @@ enqueue(WithDelay) → delayed ──[promoter: ready-at≤now]──→ ready
 Two background loops (reaper, promoter) plus the worker claim loop move jobs between states
 automatically; the only operator-driven transition is `RequeueDLQ` (dlq→ready, exposed via the
 API). Heartbeat (`broker.Extend`, `ZADD XX`) pushes a job's `inflight` deadline forward while a
-long handler runs, so the reaper does not reclaim live work.
+long handler runs, so the reaper does not reclaim live work. The `q:{name}:processed` and
+`q:{name}:dead` counters are **observational** (monotonic INCRs inside `ack.lua`/`nack.lua`) —
+they do not introduce any new job-state transition.
 
 ## Layout (✅ built · ◻ planned)
 
@@ -134,9 +152,9 @@ internal/worker/                   # ✅ Worker + Reaper + Promoter runtime
 internal/metrics/                  # ✅ Prometheus Recorder + DepthCollector
 internal/api/                      # ✅ JSON REST API handler (Phase 3a)
 internal/client/                   # ◻ producer SDK (Phase 3c)
-web/                               # ◻ embedded dashboard assets (Phase 3b)
+web/                               # ✅ Vite+React dashboard + web/embed.go (Phase 3b)
 deployments/docker-compose.yml     # ◻ redis + server + N workers + demo (Phase 3d)
-.github/workflows/ci.yml           # ✅ Redis service + go test -race + golangci-lint
+.github/workflows/ci.yml           # ✅ Redis service + go test -race + golangci-lint + dashboard CI
 ```
 
 Use `internal/` for everything not meant as a public import surface. `cmd/` holds only thin
@@ -146,7 +164,7 @@ Use `internal/` for everything not meant as a public import surface. `cmd/` hold
 
 1. **Phase 1 — core: ✅ done.** job model; enqueue/claim/ack/nack Lua; reaper; worker runtime; basic DLQ; integration tests; CI. A working, testable queue ships first.
 2. **Phase 2 — depth: ✅ done.** delayed jobs + promoter ✅; backoff + jitter ✅; priority ✅; idempotency ✅; rate limiting ✅; Prometheus metrics ✅.
-3. **Phase 3 — polish (in progress):** 3a HTTP API + server ✅ done; 3b dashboard (web/); 3c producer SDK (`internal/client`); 3d docker-compose + deploy + README diagram.
+3. **Phase 3 — polish (in progress):** 3a HTTP API + server ✅; 3b dashboard ✅; 3c producer SDK (`internal/client`); 3d docker-compose + deploy + README diagram.
 4. **Future work (NOT now):** Postgres-backed (`SKIP LOCKED`) mode; exactly-once via consumer outbox.
 
 ## Conventions
@@ -170,11 +188,16 @@ Use `internal/` for everything not meant as a public import surface. `cmd/` hold
   - `github.com/redis/go-redis/v9` — a Redis *driver*, not a queue library.
   - `github.com/prometheus/client_golang` — a metrics instrumentation library, not a queue library.
   Neither violates the "build the queue from scratch on Redis" rule. The queue logic is ours.
+- **Frontend (`web/`)** builds with Node/Vite under its own `package.json`; `npm run typecheck`,
+  `npm run test` (vitest), and `npm run build` are all independent of the Go module. The Go binary
+  embeds the committed `web/dist` at compile time via `go:embed` (`web/embed.go`), so `go build
+  ./...` needs no Node toolchain — only a stale dist would be an issue (CI catches it).
 - **Tests need a real Redis** at `localhost:6379` (override with `REDIS_ADDR`). Each Redis-using
   package claims its own logical DB so `go test ./...` runs them in parallel without flushing each
   other (broker → **DB 15**, worker → **DB 14**, metrics → **DB 13**, api → **DB 12**; a new one
   picks another), with `FlushDB` per test, and they **skip** (not fail) when Redis is unreachable
-  — so a green local run with no Redis means those suites were skipped. CI provides a Redis service.
+  — so a green local run with no Redis means those suites were skipped. CI provides a Redis
+  service. Frontend tests (`npm run test`) need no Redis.
 
 ```sh
 go build ./...
@@ -184,7 +207,10 @@ golangci-lint run                            # CI pins v2.12.2; default linters,
 # run it end to end against a local Redis:
 go run ./cmd/worker -queue demo -concurrency 4 &   # worker pool + reaper
 go run ./cmd/demo   -queue demo -count 100         # enqueue load
-go run ./cmd/server -queues demo                   # API :8080 + /metrics + /healthz
+go run ./cmd/server -queues demo                   # API + dashboard at http://localhost:8080
+
+# frontend dev/test (requires Node 20+):
+cd web && npm ci && npm run typecheck && npm run test && npm run build
 ```
 
 Keep this section updated as the Makefile / docker-compose take shape.

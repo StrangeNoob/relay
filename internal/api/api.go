@@ -35,6 +35,7 @@ func New(b *broker.Broker, logger *slog.Logger) http.Handler {
 	mux.HandleFunc("GET /api/queues/{queue}/dlq", a.listDLQ)
 	mux.HandleFunc("POST /api/queues/{queue}/dlq/{id}/requeue", a.requeueDLQ)
 	mux.HandleFunc("GET /api/queues", a.queues)
+	mux.HandleFunc("GET /api/stream", a.stream)
 	return mux
 }
 
