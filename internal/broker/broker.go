@@ -88,6 +88,10 @@ func dlqKey(queue string) string { return "q:" + queue + ":dlq" }
 // ZSET scored by each job's ready-at time. The promoter scans it.
 func delayedKey(queue string) string { return "q:" + queue + ":delayed" }
 
+// processedKey is the Redis key for a queue's cumulative processed counter:
+// `q:{name}:processed`, INCR'd by ack.lua. Read by the dashboard for throughput.
+func processedKey(queue string) string { return "q:" + queue + ":processed" }
+
 // enqueueConfig holds resolved enqueue options. A zero readyAt means "now".
 type enqueueConfig struct {
 	readyAt           time.Time
@@ -251,7 +255,7 @@ func (b *Broker) Claim(ctx context.Context, queue string, visibility time.Durati
 // as one Lua script (ack.lua).
 func (b *Broker) Ack(ctx context.Context, j job.Job) error {
 	if err := ackScript.Run(ctx, b.rdb,
-		[]string{inflightKey(j.Queue)},
+		[]string{inflightKey(j.Queue), processedKey(j.Queue)},
 		j.ID, jobKeyPrefix,
 	).Err(); err != nil {
 		return fmt.Errorf("broker: acking job %s: %w", j.ID, err)

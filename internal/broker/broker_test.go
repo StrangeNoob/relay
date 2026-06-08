@@ -1408,3 +1408,22 @@ func TestQueuesEmpty(t *testing.T) {
 		t.Errorf("names = %v, want empty", names)
 	}
 }
+
+func TestAckIncrementsProcessedCounter(t *testing.T) {
+	b, rdb := newTestBroker(t)
+	ctx := context.Background()
+
+	if err := b.Enqueue(ctx, job.New("emails", []byte("x"))); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	j, ok, err := b.Claim(ctx, "emails", time.Minute)
+	if err != nil || !ok {
+		t.Fatalf("Claim: ok=%v err=%v", ok, err)
+	}
+	if err := b.Ack(ctx, j); err != nil {
+		t.Fatalf("Ack: %v", err)
+	}
+	if n, _ := rdb.Get(ctx, "q:emails:processed").Int64(); n != 1 {
+		t.Errorf("q:emails:processed = %d, want 1", n)
+	}
+}
