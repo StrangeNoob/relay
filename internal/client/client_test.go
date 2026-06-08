@@ -149,3 +149,47 @@ func TestQueuesDecodes(t *testing.T) {
 		t.Errorf("queues = %v", qs)
 	}
 }
+
+func TestListDLQDecodesAndSendsPaging(t *testing.T) {
+	var gotQuery string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotQuery = r.URL.RawQuery
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[{"id":"j1","queue":"emails","payload":"p","state":"dead","attempts":5,"max_retries":5,"priority":0,"created_at":"2026-06-09T00:00:00Z"}]`))
+	}))
+	defer srv.Close()
+	c := client.New(srv.URL)
+	jobs, err := c.ListDLQ(context.Background(), "emails", 10, 5)
+	if err != nil {
+		t.Fatalf("ListDLQ: %v", err)
+	}
+	if len(jobs) != 1 || jobs[0].ID != "j1" || jobs[0].Attempts != 5 || jobs[0].Payload != "p" {
+		t.Errorf("jobs = %+v", jobs)
+	}
+	if gotQuery != "limit=10&offset=5" {
+		t.Errorf("query = %q, want limit=10&offset=5", gotQuery)
+	}
+}
+
+func TestRequeueOKAndNotFound(t *testing.T) {
+	ok := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/api/queues/emails/dlq/j1/requeue" {
+			t.Errorf("method/path = %s %s", r.Method, r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"requeued":true}`))
+	}))
+	defer ok.Close()
+	if err := client.New(ok.URL).Requeue(context.Background(), "emails", "j1"); err != nil {
+		t.Errorf("Requeue ok: %v", err)
+	}
+
+	nf := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`{"error":"job not found in dlq"}`))
+	}))
+	defer nf.Close()
+	if err := client.New(nf.URL).Requeue(context.Background(), "emails", "nope"); !errors.Is(err, client.ErrNotFound) {
+		t.Errorf("err = %v, want ErrNotFound", err)
+	}
+}

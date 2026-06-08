@@ -12,6 +12,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -143,6 +144,42 @@ func (c *Client) Queues(ctx context.Context) ([]string, error) {
 		return nil, err
 	}
 	return qs, nil
+}
+
+// Job mirrors the API's job view (payload and created_at are strings as the
+// server renders them).
+type Job struct {
+	ID             string `json:"id"`
+	Queue          string `json:"queue"`
+	Payload        string `json:"payload"`
+	State          string `json:"state"`
+	Attempts       int    `json:"attempts"`
+	MaxRetries     int    `json:"max_retries"`
+	Priority       int    `json:"priority"`
+	CreatedAt      string `json:"created_at"`
+	IdempotencyKey string `json:"idempotency_key,omitempty"`
+}
+
+// ListDLQ returns up to limit dead-lettered jobs for a queue, starting at offset.
+func (c *Client) ListDLQ(ctx context.Context, queue string, limit, offset int) ([]Job, error) {
+	path := "/api/queues/" + url.PathEscape(queue) + "/dlq?limit=" + strconv.Itoa(limit) + "&offset=" + strconv.Itoa(offset)
+	var jobs []Job
+	if err := c.do(ctx, http.MethodGet, path, nil, &jobs); err != nil {
+		return nil, err
+	}
+	return jobs, nil
+}
+
+// Requeue moves a dead-lettered job back to ready. An id not present in the DLQ
+// yields ErrNotFound.
+func (c *Client) Requeue(ctx context.Context, queue, id string) error {
+	path := "/api/queues/" + url.PathEscape(queue) + "/dlq/" + url.PathEscape(id) + "/requeue"
+	err := c.do(ctx, http.MethodPost, path, nil, nil)
+	var apiErr *APIError
+	if errors.As(err, &apiErr) && apiErr.Status == http.StatusNotFound {
+		return ErrNotFound
+	}
+	return err
 }
 
 // do performs a request with an optional JSON body, decoding a 2xx JSON response
