@@ -142,12 +142,42 @@ func parseInt64(s string, def int64) (int64, error) {
 
 // --- temporary stubs, replaced in Tasks 6-7 ---
 
-func (a *API) stats(w http.ResponseWriter, _ *http.Request) {
-	a.writeError(w, http.StatusNotImplemented, "not implemented")
+// stats handles GET /api/queues/{queue}/stats.
+func (a *API) stats(w http.ResponseWriter, r *http.Request) {
+	queue := r.PathValue("queue")
+	s, err := a.broker.Stats(r.Context(), queue)
+	if err != nil {
+		a.logger.Error("api: stats failed", "queue", queue, "err", err)
+		a.writeError(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	a.writeJSON(w, http.StatusOK, s)
 }
 
-func (a *API) listDLQ(w http.ResponseWriter, _ *http.Request) {
-	a.writeError(w, http.StatusNotImplemented, "not implemented")
+// listDLQ handles GET /api/queues/{queue}/dlq?limit=&offset=.
+func (a *API) listDLQ(w http.ResponseWriter, r *http.Request) {
+	queue := r.PathValue("queue")
+	limit, err := parseInt64(r.URL.Query().Get("limit"), 0)
+	if err != nil {
+		a.writeError(w, http.StatusBadRequest, "invalid limit")
+		return
+	}
+	offset, err := parseInt64(r.URL.Query().Get("offset"), 0)
+	if err != nil {
+		a.writeError(w, http.StatusBadRequest, "invalid offset")
+		return
+	}
+	jobs, err := a.broker.ListDLQ(r.Context(), queue, limit, offset)
+	if err != nil {
+		a.logger.Error("api: list dlq failed", "queue", queue, "err", err)
+		a.writeError(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	views := make([]jobView, 0, len(jobs))
+	for _, j := range jobs {
+		views = append(views, toJobView(j))
+	}
+	a.writeJSON(w, http.StatusOK, views)
 }
 
 func (a *API) requeueDLQ(w http.ResponseWriter, _ *http.Request) {

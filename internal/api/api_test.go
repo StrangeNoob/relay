@@ -15,6 +15,7 @@ import (
 
 	"github.com/StrangeNoob/relay/internal/api"
 	"github.com/StrangeNoob/relay/internal/broker"
+	"github.com/StrangeNoob/relay/internal/job"
 )
 
 // apiTestRedisDB is this package's dedicated Redis DB. broker tests use 15,
@@ -100,6 +101,72 @@ func TestEnqueueBadJSONReturns400(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/api/queues/emails/jobs", bytes.NewReader([]byte("{not json")))
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", rec.Code)
+	}
+}
+
+// mustJob builds a job for tests via the broker's job package.
+func mustJob(queue, payload string) job.Job {
+	return job.New(queue, []byte(payload))
+}
+
+func TestStatsEndpoint(t *testing.T) {
+	h, b, _ := newTestAPI(t)
+	ctx := context.Background()
+	for i := 0; i < 2; i++ {
+		if err := b.Enqueue(ctx, mustJob("emails", "x")); err != nil {
+			t.Fatalf("Enqueue: %v", err)
+		}
+	}
+
+	rec := do(t, h, http.MethodGet, "/api/queues/emails/stats", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	var s struct {
+		Ready    int64 `json:"ready"`
+		Inflight int64 `json:"inflight"`
+		Delayed  int64 `json:"delayed"`
+		DLQ      int64 `json:"dlq"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &s); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if s.Ready != 2 {
+		t.Errorf("ready = %d, want 2", s.Ready)
+	}
+}
+
+func TestDLQListEndpoint(t *testing.T) {
+	h, b, rdb := newTestAPI(t)
+	ctx := context.Background()
+	j := mustJob("emails", "dead")
+	j.State = "dead"
+	if err := rdb.HSet(ctx, "job:"+j.ID, j.ToHash()).Err(); err != nil {
+		t.Fatalf("HSet: %v", err)
+	}
+	if err := rdb.RPush(ctx, "q:emails:dlq", j.ID).Err(); err != nil {
+		t.Fatalf("RPush: %v", err)
+	}
+	_ = b
+
+	rec := do(t, h, http.MethodGet, "/api/queues/emails/dlq", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	var jobs []map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &jobs); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(jobs) != 1 || jobs[0]["id"] != j.ID {
+		t.Errorf("jobs = %v, want one with id %s", jobs, j.ID)
+	}
+}
+
+func TestDLQListBadLimitReturns400(t *testing.T) {
+	h, _, _ := newTestAPI(t)
+	rec := do(t, h, http.MethodGet, "/api/queues/emails/dlq?limit=abc", nil)
 	if rec.Code != http.StatusBadRequest {
 		t.Errorf("status = %d, want 400", rec.Code)
 	}
