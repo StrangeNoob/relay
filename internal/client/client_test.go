@@ -109,3 +109,43 @@ func TestEnqueueAPIErrorOnServerError(t *testing.T) {
 		t.Errorf("err = %v, want APIError{500, boom}", err)
 	}
 }
+
+func TestStatsDecodes(t *testing.T) {
+	var gotPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ready":3,"inflight":1,"delayed":2,"dlq":4}`))
+	}))
+	defer srv.Close()
+	c := client.New(srv.URL)
+	s, err := c.Stats(context.Background(), "emails")
+	if err != nil {
+		t.Fatalf("Stats: %v", err)
+	}
+	if s.Ready != 3 || s.Inflight != 1 || s.Delayed != 2 || s.DLQ != 4 {
+		t.Errorf("stats = %+v", s)
+	}
+	if gotPath != "/api/queues/emails/stats" {
+		t.Errorf("path = %s", gotPath)
+	}
+}
+
+func TestQueuesDecodes(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/queues" {
+			t.Errorf("path = %s", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`["emails","sms"]`))
+	}))
+	defer srv.Close()
+	c := client.New(srv.URL)
+	qs, err := c.Queues(context.Background())
+	if err != nil {
+		t.Fatalf("Queues: %v", err)
+	}
+	if len(qs) != 2 || qs[0] != "emails" || qs[1] != "sms" {
+		t.Errorf("queues = %v", qs)
+	}
+}

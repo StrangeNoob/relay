@@ -119,6 +119,32 @@ func (c *Client) Enqueue(ctx context.Context, queue string, payload []byte, opts
 	return res, nil
 }
 
+// Stats is a queue's point-in-time depth by state.
+type Stats struct {
+	Ready    int64 `json:"ready"`
+	Inflight int64 `json:"inflight"`
+	Delayed  int64 `json:"delayed"`
+	DLQ      int64 `json:"dlq"`
+}
+
+// Stats returns the current depth of each of a queue's states.
+func (c *Client) Stats(ctx context.Context, queue string) (Stats, error) {
+	var s Stats
+	if err := c.do(ctx, http.MethodGet, "/api/queues/"+url.PathEscape(queue)+"/stats", nil, &s); err != nil {
+		return Stats{}, err
+	}
+	return s, nil
+}
+
+// Queues returns the distinct queue names the server knows about.
+func (c *Client) Queues(ctx context.Context) ([]string, error) {
+	var qs []string
+	if err := c.do(ctx, http.MethodGet, "/api/queues", nil, &qs); err != nil {
+		return nil, err
+	}
+	return qs, nil
+}
+
 // do performs a request with an optional JSON body, decoding a 2xx JSON response
 // into out (when non-nil). Non-2xx responses become an *APIError carrying the
 // status and the {"error":...} message; transport/marshal errors are wrapped.
