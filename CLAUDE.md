@@ -10,25 +10,30 @@ project: the point is to *prove understanding of queue internals*, not to wrap a
 library. Do not introduce a queue dependency (BullMQ, asynq, Machinery, Celery, etc.) — the
 mechanics are the deliverable.
 
-**Status: Phase 1 complete; Phase 2 nearly complete.** The core engine plus delayed jobs, the
-promoter, retry backoff, priority, idempotency enforcement, and per-queue rate limiting are built,
-tested against a real Redis under `-race`, and CI is green (only Prometheus metrics remain in
-Phase 2). Repo: <https://github.com/StrangeNoob/relay>. What exists today:
+**Status: Phase 1 complete; Phase 2 complete.** The core engine plus delayed jobs, the promoter,
+retry backoff, priority, idempotency enforcement, per-queue rate limiting, and Prometheus metrics
+are built, tested against a real Redis under `-race`, and CI is green. Phase 3 (API/dashboard) is
+next. Repo: <https://github.com/StrangeNoob/relay>. What exists today:
 
 - `internal/job` — the `Job` model + Redis-hash encoding (`ToHash`/`FromHash`).
 - `internal/broker` — `Enqueue` (with `WithDelay`/`WithReadyAt`/`WithPriority`/`WithIdempotencyKey` options), atomic `Claim`, `Ack`,
   `Nack` (full-jitter backoff via the delayed set), `Reap`, `Promote`, `Extend` (heartbeat), with
   Lua under `internal/broker/scripts/`: `enqueue.lua`, `claim.lua`, `ack.lua`, `nack.lua`,
   `reaper.lua`, `promote.lua`, `heartbeat.lua`. Broker options: `WithBackoff`, `WithDedupTTL`,
-  `WithRateLimit(queue, rate, burst)` (token-bucket per-queue rate limiting via Redis hash).
+  `WithRateLimit(queue, rate, burst)` (token-bucket per-queue rate limiting via Redis hash),
+  `WithMetrics(m)` (installs a `broker.Metrics` implementation; default is a no-op).
+- `internal/metrics` — Prometheus `Recorder` (implements `broker.Metrics`; counters
+  `relay_jobs_*_total`, histogram `relay_job_latency_seconds`, all labelled by queue) and
+  `DepthCollector` (a `prometheus.Collector` reporting `relay_queue_depth{queue,state}` gauges
+  by reading ZCARD/LLEN at scrape time).
 - `internal/worker` — `Worker` (claim loop, dispatch, heartbeat, graceful shutdown), plus `Reaper`
   and `Promoter` background loops sharing one `runDrainLoop` helper.
 - `cmd/worker`, `cmd/demo` — thin runnable entrypoints (worker pool + reaper + promoter; load
-  generator with `--delay`).
+  generator with `--delay`). `cmd/worker` accepts `--metrics-addr` (default "" = off); when set,
+  serves `/metrics` and registers the depth collector with graceful shutdown.
 - `.github/workflows/ci.yml` — Redis service + `go test -race` + `golangci-lint`.
 
-Remaining Phase 2 (Prometheus metrics) and Phase 3 (API/dashboard/`cmd/server`, docker-compose,
-deploy) are **not** built yet.
+Phase 3 (API/dashboard/`cmd/server`, docker-compose, deploy) is **not** built yet.
 
 ## Source of truth
 
@@ -65,6 +70,7 @@ spec disagree, the spec wins until the spec is deliberately updated.
   (`broker.WithBackoff`).
 - **Idempotency is enqueue-only, TTL-window.** A keyed duplicate is dropped within the dedup TTL (default 24h, `WithDedupTTL`); the key is not released on completion. Delivery remains at-least-once — consumers needing exactly-once effects still dedup on the key.
 - **Rate-limit config is per-worker, not stored in Redis.** All workers on a queue must register the same `WithRateLimit` (they share one Redis bucket and pass rate/burst on every claim); mismatched configs refill inconsistently. A rate-limited claim is indistinguishable from an empty queue to the worker (it polls again).
+- **Metrics are per-process and opt-in.** `broker.WithMetrics` installs a Prometheus recorder (default is a no-op); `cmd/worker --metrics-addr` serves `/metrics`. Counters/latency are per worker process — aggregate across workers in Prometheus. Queue-depth gauges read shared Redis at scrape time (one round-trip per queue/state), so every worker reports the same depths (aggregate with max/avg, not sum). Label cardinality is per queue. The endpoint lives on `cmd/worker` until the Phase 3 server exists.
 
 ## Redis data model & job lifecycle (the architecture in brief)
 
@@ -111,7 +117,8 @@ internal/job/                      # ✅ job model + hash encoding
 internal/broker/                   # ✅ enqueue/claim/ack/nack/reap/promote/extend
 internal/broker/scripts/*.lua      # ✅ enqueue, claim, ack, nack, reaper, promote, heartbeat (go:embed)
 internal/worker/                   # ✅ Worker + Reaper + Promoter runtime
-internal/{client,api,metrics}/     # ◻ producer SDK / HTTP API / Prometheus (Phase 2–3)
+internal/metrics/                  # ✅ Prometheus Recorder + DepthCollector
+internal/{client,api}/             # ◻ producer SDK / HTTP API (Phase 3)
 web/                               # ◻ embedded dashboard assets (Phase 3)
 deployments/docker-compose.yml     # ◻ redis + server + N workers + demo (Phase 3)
 .github/workflows/ci.yml           # ✅ Redis service + go test -race + golangci-lint
@@ -123,7 +130,7 @@ Use `internal/` for everything not meant as a public import surface. `cmd/` hold
 ## Build order (do not jump ahead)
 
 1. **Phase 1 — core: ✅ done.** job model; enqueue/claim/ack/nack Lua; reaper; worker runtime; basic DLQ; integration tests; CI. A working, testable queue ships first.
-2. **Phase 2 — depth (in progress):** delayed jobs + promoter ✅; backoff + jitter ✅; priority ✅; idempotency ✅; rate limiting ✅; Prometheus metrics still to do.
+2. **Phase 2 — depth: ✅ done.** delayed jobs + promoter ✅; backoff + jitter ✅; priority ✅; idempotency ✅; rate limiting ✅; Prometheus metrics ✅.
 3. **Phase 3 — polish:** dashboard; docker-compose demo; deployed demo; README + diagram.
 4. **Future work (NOT now):** Postgres-backed (`SKIP LOCKED`) mode; exactly-once via consumer outbox.
 
@@ -144,11 +151,15 @@ Use `internal/` for everything not meant as a public import surface. `cmd/` hold
 - **Module:** `github.com/StrangeNoob/relay`.
 - **Toolchain:** `go 1.24` with `toolchain go1.25.11` pinned in `go.mod` (go-redis v9 needs ≥1.24).
   If a `go1.24` toolchain download fails, the pin makes the build use the already-cached 1.25.x.
-- **Only dependency:** `github.com/redis/go-redis/v9` — a Redis *driver*, not a queue library; it
-  does not violate the "no queue dependency" rule. The queue logic is ours.
-- **Tests need a real Redis** at `localhost:6379` (override with `REDIS_ADDR`). They use **DB 15**
-  and `FlushDB` per test, and **skip** (not fail) when Redis is unreachable — so a green local run
-  with no Redis means the broker/worker suites were skipped. CI provides a Redis service.
+- **Direct dependencies (two):**
+  - `github.com/redis/go-redis/v9` — a Redis *driver*, not a queue library.
+  - `github.com/prometheus/client_golang` — a metrics instrumentation library, not a queue library.
+  Neither violates the "build the queue from scratch on Redis" rule. The queue logic is ours.
+- **Tests need a real Redis** at `localhost:6379` (override with `REDIS_ADDR`). Each Redis-using
+  package claims its own logical DB so `go test ./...` runs them in parallel without flushing each
+  other (broker → **DB 15**, worker → **DB 14**, metrics → **DB 13**; a new one picks another), with
+  `FlushDB` per test, and they **skip** (not fail) when Redis is unreachable — so a green local run
+  with no Redis means those suites were skipped. CI provides a Redis service.
 
 ```sh
 go build ./...

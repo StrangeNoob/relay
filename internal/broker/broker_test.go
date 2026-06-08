@@ -31,6 +31,13 @@ const testRedisDB = 15
 // off-CI.
 func newTestBroker(t *testing.T) (*broker.Broker, *redis.Client) {
 	t.Helper()
+	return newTestBrokerWith(t)
+}
+
+// newTestBrokerWith is newTestBroker with broker options, for tests that need to
+// inject a recorder or other configuration.
+func newTestBrokerWith(t *testing.T, opts ...broker.Option) (*broker.Broker, *redis.Client) {
+	t.Helper()
 	addr := os.Getenv("REDIS_ADDR")
 	if addr == "" {
 		addr = "localhost:6379"
@@ -44,7 +51,7 @@ func newTestBroker(t *testing.T) (*broker.Broker, *redis.Client) {
 		t.Fatalf("flushdb: %v", err)
 	}
 	t.Cleanup(func() { _ = rdb.Close() })
-	return broker.New(rdb), rdb
+	return broker.New(rdb, opts...), rdb
 }
 
 func TestEnqueuePersistsJob(t *testing.T) {

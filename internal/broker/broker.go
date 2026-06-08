@@ -27,6 +27,7 @@ type Broker struct {
 	backoffMax  time.Duration
 	dedupTTL    time.Duration
 	rateLimits  map[string]rateLimit
+	metrics     Metrics
 
 	rndMu sync.Mutex
 	rnd   *rand.Rand
@@ -53,6 +54,7 @@ func New(rdb *redis.Client, opts ...Option) *Broker {
 		backoffBase: time.Second,
 		backoffMax:  10 * time.Minute,
 		dedupTTL:    24 * time.Hour,
+		metrics:     noopMetrics{},
 		rnd:         rand.New(rand.NewSource(time.Now().UnixNano())),
 	}
 	for _, opt := range opts {
@@ -197,8 +199,10 @@ func (b *Broker) Enqueue(ctx context.Context, j job.Job, opts ...EnqueueOption) 
 		return fmt.Errorf("broker: enqueuing job %s: %w", j.ID, err)
 	}
 	if res == "dup" {
+		b.metrics.IncDeduplicated(j.Queue)
 		return ErrDuplicate
 	}
+	b.metrics.IncEnqueued(j.Queue)
 	return nil
 }
 
@@ -236,6 +240,7 @@ func (b *Broker) Claim(ctx context.Context, queue string, visibility time.Durati
 	if err != nil {
 		return job.Job{}, false, fmt.Errorf("broker: claiming from %q: %w", queue, err)
 	}
+	b.metrics.IncClaimed(queue)
 	return j, true, nil
 }
 
@@ -249,6 +254,8 @@ func (b *Broker) Ack(ctx context.Context, j job.Job) error {
 	).Err(); err != nil {
 		return fmt.Errorf("broker: acking job %s: %w", j.ID, err)
 	}
+	b.metrics.IncProcessed(j.Queue)
+	b.metrics.ObserveLatency(j.Queue, time.Since(j.CreatedAt))
 	return nil
 }
 
@@ -263,11 +270,20 @@ func (b *Broker) Nack(ctx context.Context, j job.Job) error {
 	b.rndMu.Unlock()
 	readyAt := time.Now().Add(delay).UnixMilli()
 
-	if err := nackScript.Run(ctx, b.rdb,
+	outcome, err := nackScript.Run(ctx, b.rdb,
 		[]string{inflightKey(j.Queue), delayedKey(j.Queue), dlqKey(j.Queue)},
 		j.ID, jobKeyPrefix, readyAt,
-	).Err(); err != nil {
+	).Text()
+	if err != nil {
 		return fmt.Errorf("broker: nacking job %s: %w", j.ID, err)
+	}
+	// nack.lua returns "retry" or "dead"; any other value intentionally records
+	// nothing rather than mis-attributing a count.
+	switch outcome {
+	case "retry":
+		b.metrics.IncRetried(j.Queue)
+	case "dead":
+		b.metrics.IncDead(j.Queue)
 	}
 	return nil
 }
@@ -296,6 +312,9 @@ func (b *Broker) Reap(ctx context.Context, queue string) (int, error) {
 	if err != nil {
 		return 0, fmt.Errorf("broker: reaping %q: %w", queue, err)
 	}
+	if n > 0 {
+		b.metrics.AddReaped(queue, n)
+	}
 	return n, nil
 }
 
@@ -310,6 +329,9 @@ func (b *Broker) Promote(ctx context.Context, queue string) (int, error) {
 	).Int()
 	if err != nil {
 		return 0, fmt.Errorf("broker: promoting %q: %w", queue, err)
+	}
+	if n > 0 {
+		b.metrics.AddPromoted(queue, n)
 	}
 	return n, nil
 }
