@@ -10,6 +10,8 @@ import (
 	"errors"
 	"fmt"
 	"math/rand"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -351,6 +353,125 @@ func (b *Broker) Extend(ctx context.Context, j job.Job, visibility time.Duration
 		return false, fmt.Errorf("broker: extending job %s: %w", j.ID, err)
 	}
 	return n == 1, nil
+}
+
+// Stats is a point-in-time count of a queue's jobs by state. Each field is the
+// cardinality of the corresponding Redis structure for the queue.
+type Stats struct {
+	Ready    int64 `json:"ready"`
+	Inflight int64 `json:"inflight"`
+	Delayed  int64 `json:"delayed"`
+	DLQ      int64 `json:"dlq"`
+}
+
+// Stats returns the current depth of each of a queue's states in one round trip.
+// ready/inflight/delayed are ZSETs (ZCARD); the dlq is a list (LLEN).
+func (b *Broker) Stats(ctx context.Context, queue string) (Stats, error) {
+	pipe := b.rdb.Pipeline()
+	ready := pipe.ZCard(ctx, readyKey(queue))
+	inflight := pipe.ZCard(ctx, inflightKey(queue))
+	delayed := pipe.ZCard(ctx, delayedKey(queue))
+	dlq := pipe.LLen(ctx, dlqKey(queue))
+	if _, err := pipe.Exec(ctx); err != nil {
+		return Stats{}, fmt.Errorf("broker: stats for %q: %w", queue, err)
+	}
+	return Stats{
+		Ready:    ready.Val(),
+		Inflight: inflight.Val(),
+		Delayed:  delayed.Val(),
+		DLQ:      dlq.Val(),
+	}, nil
+}
+
+// DLQ listing bounds: an unset/zero limit uses the default; the max caps a single
+// page so a huge DLQ cannot be slurped in one request.
+const (
+	defaultDLQLimit = 50
+	maxDLQLimit     = 1000
+)
+
+// ListDLQ returns up to limit dead-lettered jobs for a queue, starting at offset
+// (0-based) in insertion order. A limit <= 0 uses the default; limits above the
+// max are clamped. Job ids whose hash has already been removed are skipped.
+func (b *Broker) ListDLQ(ctx context.Context, queue string, limit, offset int64) ([]job.Job, error) {
+	if limit <= 0 {
+		limit = defaultDLQLimit
+	}
+	if limit > maxDLQLimit {
+		limit = maxDLQLimit
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	ids, err := b.rdb.LRange(ctx, dlqKey(queue), offset, offset+limit-1).Result()
+	if err != nil {
+		return nil, fmt.Errorf("broker: listing dlq for %q: %w", queue, err)
+	}
+	jobs := make([]job.Job, 0, len(ids))
+	for _, id := range ids {
+		h, err := b.rdb.HGetAll(ctx, jobKey(id)).Result()
+		if err != nil {
+			return nil, fmt.Errorf("broker: loading dlq job %s: %w", id, err)
+		}
+		if len(h) == 0 {
+			continue // hash already cleaned up; skip
+		}
+		j, err := job.FromHash(h)
+		if err != nil {
+			return nil, fmt.Errorf("broker: decoding dlq job %s: %w", id, err)
+		}
+		jobs = append(jobs, j)
+	}
+	return jobs, nil
+}
+
+// RequeueDLQ moves a dead-lettered job back into the ready set for another run,
+// resetting its attempts to 0 (a deliberate operator retry). The move is atomic
+// in requeue.lua. It returns (false, nil) when the id is not in the queue's DLQ.
+func (b *Broker) RequeueDLQ(ctx context.Context, queue, id string) (bool, error) {
+	n, err := requeueScript.Run(ctx, b.rdb,
+		[]string{dlqKey(queue), readyKey(queue)},
+		id, jobKeyPrefix, time.Now().UnixMilli(), priorityScale,
+	).Int()
+	if err != nil {
+		return false, fmt.Errorf("broker: requeuing dlq job %s: %w", id, err)
+	}
+	return n == 1, nil
+}
+
+// Queues discovers the distinct queue names present in Redis by scanning for the
+// per-queue key prefix `q:{name}:...`. It uses a non-blocking SCAN cursor loop,
+// dedupes, and returns the names sorted for stable output. On a large keyspace
+// this still iterates every key (bounded work per round trip).
+func (b *Broker) Queues(ctx context.Context) ([]string, error) {
+	seen := make(map[string]struct{})
+	var cursor uint64
+	for {
+		keys, next, err := b.rdb.Scan(ctx, cursor, "q:*", 200).Result()
+		if err != nil {
+			return nil, fmt.Errorf("broker: scanning queues: %w", err)
+		}
+		for _, k := range keys {
+			// k is "q:{name}:{suffix...}"; the name is the segment between the
+			// leading "q:" and the next ":".
+			rest := strings.TrimPrefix(k, "q:")
+			i := strings.IndexByte(rest, ':')
+			if i <= 0 {
+				continue
+			}
+			seen[rest[:i]] = struct{}{}
+		}
+		cursor = next
+		if cursor == 0 {
+			break
+		}
+	}
+	names := make([]string, 0, len(seen))
+	for n := range seen {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	return names, nil
 }
 
 // hashFromLua converts the flat HGETALL array a script returns (alternating

@@ -1215,3 +1215,196 @@ func TestRateLimitConcurrentClaimsRespectBurst(t *testing.T) {
 		t.Errorf("inflight = %d, want 5", n)
 	}
 }
+
+// deadLetter enqueues a job with no retry budget, claims it, and nacks it so it
+// lands in the DLQ; it returns the dead-lettered job's id.
+func deadLetter(t *testing.T, b *broker.Broker, ctx context.Context, queue, payload string) string {
+	t.Helper()
+	j := job.New(queue, []byte(payload))
+	j.MaxRetries = 0
+	if err := b.Enqueue(ctx, j); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	claimed, ok, err := b.Claim(ctx, queue, time.Minute)
+	if err != nil || !ok {
+		t.Fatalf("Claim: ok=%v err=%v", ok, err)
+	}
+	if err := b.Nack(ctx, claimed); err != nil {
+		t.Fatalf("Nack: %v", err)
+	}
+	return claimed.ID
+}
+
+func TestListDLQReturnsDeadJobs(t *testing.T) {
+	b, _ := newTestBroker(t)
+	ctx := context.Background()
+
+	id1 := deadLetter(t, b, ctx, "emails", "a")
+	id2 := deadLetter(t, b, ctx, "emails", "b")
+
+	jobs, err := b.ListDLQ(ctx, "emails", 0, 0)
+	if err != nil {
+		t.Fatalf("ListDLQ: %v", err)
+	}
+	if len(jobs) != 2 {
+		t.Fatalf("len = %d, want 2", len(jobs))
+	}
+	if jobs[0].ID != id1 || jobs[1].ID != id2 {
+		t.Errorf("ids = %s,%s want %s,%s", jobs[0].ID, jobs[1].ID, id1, id2)
+	}
+	if jobs[0].State != job.StateDead {
+		t.Errorf("state = %q, want dead", jobs[0].State)
+	}
+}
+
+func TestListDLQPaginates(t *testing.T) {
+	b, _ := newTestBroker(t)
+	ctx := context.Background()
+	for i := 0; i < 3; i++ {
+		deadLetter(t, b, ctx, "emails", "x")
+	}
+	page, err := b.ListDLQ(ctx, "emails", 2, 1) // limit 2, offset 1 -> items 2 and 3
+	if err != nil {
+		t.Fatalf("ListDLQ: %v", err)
+	}
+	if len(page) != 2 {
+		t.Errorf("len = %d, want 2", len(page))
+	}
+}
+
+func TestListDLQEmpty(t *testing.T) {
+	b, _ := newTestBroker(t)
+	jobs, err := b.ListDLQ(context.Background(), "emails", 0, 0)
+	if err != nil {
+		t.Fatalf("ListDLQ: %v", err)
+	}
+	if len(jobs) != 0 {
+		t.Errorf("len = %d, want 0", len(jobs))
+	}
+}
+
+func TestStatsCountsEachState(t *testing.T) {
+	b, rdb := newTestBroker(t)
+	ctx := context.Background()
+
+	// 2 ready
+	for i := 0; i < 2; i++ {
+		if err := b.Enqueue(ctx, job.New("emails", []byte("r"))); err != nil {
+			t.Fatalf("Enqueue ready: %v", err)
+		}
+	}
+	// 1 delayed
+	if err := b.Enqueue(ctx, job.New("emails", []byte("d")), broker.WithDelay(time.Hour)); err != nil {
+		t.Fatalf("Enqueue delayed: %v", err)
+	}
+	// 1 inflight: enqueue then claim it
+	if err := b.Enqueue(ctx, job.New("emails", []byte("i"))); err != nil {
+		t.Fatalf("Enqueue inflight: %v", err)
+	}
+	if _, ok, err := b.Claim(ctx, "emails", time.Minute); err != nil || !ok {
+		t.Fatalf("Claim: ok=%v err=%v", ok, err)
+	}
+	// 1 dlq: push an id directly so the count is unambiguous
+	if err := rdb.RPush(ctx, "q:emails:dlq", "deadid").Err(); err != nil {
+		t.Fatalf("seed dlq: %v", err)
+	}
+
+	s, err := b.Stats(ctx, "emails")
+	if err != nil {
+		t.Fatalf("Stats: %v", err)
+	}
+	if s.Ready != 2 {
+		t.Errorf("Ready = %d, want 2", s.Ready)
+	}
+	if s.Inflight != 1 {
+		t.Errorf("Inflight = %d, want 1", s.Inflight)
+	}
+	if s.Delayed != 1 {
+		t.Errorf("Delayed = %d, want 1", s.Delayed)
+	}
+	if s.DLQ != 1 {
+		t.Errorf("DLQ = %d, want 1", s.DLQ)
+	}
+}
+
+func TestRequeueDLQMovesJobBackToReady(t *testing.T) {
+	b, rdb := newTestBroker(t)
+	ctx := context.Background()
+
+	id := deadLetter(t, b, ctx, "emails", "x")
+
+	ok, err := b.RequeueDLQ(ctx, "emails", id)
+	if err != nil {
+		t.Fatalf("RequeueDLQ: %v", err)
+	}
+	if !ok {
+		t.Fatal("RequeueDLQ returned false, want true")
+	}
+
+	if n, _ := rdb.LLen(ctx, "q:emails:dlq").Result(); n != 0 {
+		t.Errorf("dlq len = %d, want 0", n)
+	}
+	if n, _ := rdb.ZCard(ctx, "q:emails:ready").Result(); n != 1 {
+		t.Errorf("ready card = %d, want 1", n)
+	}
+	h, err := rdb.HGetAll(ctx, "job:"+id).Result()
+	if err != nil {
+		t.Fatalf("HGetAll: %v", err)
+	}
+	if h["state"] != "ready" {
+		t.Errorf("state = %q, want ready", h["state"])
+	}
+	if h["attempts"] != "0" {
+		t.Errorf("attempts = %q, want 0", h["attempts"])
+	}
+
+	if _, ok, err := b.Claim(ctx, "emails", time.Minute); err != nil || !ok {
+		t.Fatalf("Claim after requeue: ok=%v err=%v", ok, err)
+	}
+}
+
+func TestRequeueDLQUnknownIDReturnsFalse(t *testing.T) {
+	b, _ := newTestBroker(t)
+	ok, err := b.RequeueDLQ(context.Background(), "emails", "nope")
+	if err != nil {
+		t.Fatalf("RequeueDLQ: %v", err)
+	}
+	if ok {
+		t.Error("RequeueDLQ returned true for an id not in the DLQ, want false")
+	}
+}
+
+func TestQueuesDiscoversDistinctNames(t *testing.T) {
+	b, _ := newTestBroker(t)
+	ctx := context.Background()
+
+	if err := b.Enqueue(ctx, job.New("emails", []byte("a"))); err != nil {
+		t.Fatalf("Enqueue emails: %v", err)
+	}
+	if err := b.Enqueue(ctx, job.New("sms", []byte("b"))); err != nil {
+		t.Fatalf("Enqueue sms: %v", err)
+	}
+	// a second key family for the same queue must not double-count it
+	if err := b.Enqueue(ctx, job.New("emails", []byte("c")), broker.WithDelay(time.Hour)); err != nil {
+		t.Fatalf("Enqueue emails delayed: %v", err)
+	}
+
+	names, err := b.Queues(ctx)
+	if err != nil {
+		t.Fatalf("Queues: %v", err)
+	}
+	if len(names) != 2 || names[0] != "emails" || names[1] != "sms" {
+		t.Errorf("names = %v, want [emails sms]", names)
+	}
+}
+
+func TestQueuesEmpty(t *testing.T) {
+	b, _ := newTestBroker(t)
+	names, err := b.Queues(context.Background())
+	if err != nil {
+		t.Fatalf("Queues: %v", err)
+	}
+	if len(names) != 0 {
+		t.Errorf("names = %v, want empty", names)
+	}
+}
