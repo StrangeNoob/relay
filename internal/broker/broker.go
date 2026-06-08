@@ -240,6 +240,7 @@ func (b *Broker) Claim(ctx context.Context, queue string, visibility time.Durati
 	if err != nil {
 		return job.Job{}, false, fmt.Errorf("broker: claiming from %q: %w", queue, err)
 	}
+	b.metrics.IncClaimed(queue)
 	return j, true, nil
 }
 

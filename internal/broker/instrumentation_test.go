@@ -103,3 +103,32 @@ func TestEnqueueDuplicateRecordsDeduplicated(t *testing.T) {
 		t.Errorf("deduped[emails] = %d, want 1", got)
 	}
 }
+
+func TestClaimRecordsClaimed(t *testing.T) {
+	fm := newFakeMetrics()
+	b, _ := newTestBrokerWith(t, broker.WithMetrics(fm))
+	ctx := context.Background()
+
+	if err := b.Enqueue(ctx, job.New("emails", []byte("x"))); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if _, ok, err := b.Claim(ctx, "emails", time.Minute); err != nil || !ok {
+		t.Fatalf("Claim: ok=%v err=%v, want true/nil", ok, err)
+	}
+	if got := fm.get(fm.claimed, "emails"); got != 1 {
+		t.Errorf("claimed[emails] = %d, want 1", got)
+	}
+}
+
+func TestClaimEmptyQueueRecordsNothing(t *testing.T) {
+	fm := newFakeMetrics()
+	b, _ := newTestBrokerWith(t, broker.WithMetrics(fm))
+	ctx := context.Background()
+
+	if _, ok, err := b.Claim(ctx, "emails", time.Minute); err != nil || ok {
+		t.Fatalf("Claim on empty: ok=%v err=%v, want false/nil", ok, err)
+	}
+	if got := fm.get(fm.claimed, "emails"); got != 0 {
+		t.Errorf("claimed[emails] = %d, want 0", got)
+	}
+}
