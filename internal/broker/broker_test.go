@@ -997,6 +997,49 @@ func TestWithDedupTTLRespected(t *testing.T) {
 	}
 }
 
+func TestEnqueueBulkAddsAllToReady(t *testing.T) {
+	b, rdb := newTestBroker(t)
+	ctx := context.Background()
+	jobs := make([]job.Job, 50)
+	for i := range jobs {
+		jobs[i] = job.New("emails", []byte("x"))
+	}
+	n, err := b.EnqueueBulk(ctx, jobs)
+	if err != nil {
+		t.Fatalf("EnqueueBulk: %v", err)
+	}
+	if n != 50 {
+		t.Errorf("returned %d, want 50", n)
+	}
+	if c := rdb.ZCard(ctx, "q:emails:ready").Val(); c != 50 {
+		t.Errorf("ready ZCARD = %d, want 50", c)
+	}
+}
+
+func TestEnqueueBulkWithDelayGoesToDelayed(t *testing.T) {
+	b, rdb := newTestBroker(t)
+	ctx := context.Background()
+	jobs := []job.Job{job.New("emails", []byte("a")), job.New("emails", []byte("b"))}
+	n, err := b.EnqueueBulk(ctx, jobs, broker.WithDelay(time.Hour))
+	if err != nil || n != 2 {
+		t.Fatalf("EnqueueBulk: n=%d err=%v", n, err)
+	}
+	if c := rdb.ZCard(ctx, "q:emails:delayed").Val(); c != 2 {
+		t.Errorf("delayed ZCARD = %d, want 2", c)
+	}
+	if c := rdb.ZCard(ctx, "q:emails:ready").Val(); c != 0 {
+		t.Errorf("ready ZCARD = %d, want 0", c)
+	}
+}
+
+func TestEnqueueBulkEmptyIsNoop(t *testing.T) {
+	b, _ := newTestBroker(t)
+	n, err := b.EnqueueBulk(context.Background(), nil)
+	if err != nil || n != 0 {
+		t.Errorf("EnqueueBulk(nil) = (%d, %v), want (0, nil)", n, err)
+	}
+}
+
 func TestWithIdempotencyKeyOverridesJobKey(t *testing.T) {
 	b, rdb := newTestBroker(t)
 	ctx := context.Background()
