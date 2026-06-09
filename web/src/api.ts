@@ -42,3 +42,20 @@ export async function enqueue(queue: string, body: EnqueueRequest): Promise<{ id
   if (!r.ok) throw new Error(`enqueue: ${r.status}`);
   return r.json() as Promise<{ id: string; state: string }>;
 }
+
+export interface BulkEnqueueRequest {
+  count: number;
+  payload: string;
+  priority?: number;
+  delay_ms?: number;
+}
+
+export async function enqueueBulk(queue: string, body: BulkEnqueueRequest): Promise<{ enqueued: number; state: string }> {
+  const r = await fetch(`/api/queues/${encodeURIComponent(queue)}/jobs/bulk`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!r.ok) throw new Error(`bulk enqueue: ${r.status}`);
+  return r.json();
+}
