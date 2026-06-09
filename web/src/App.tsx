@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useStream } from "./hooks/useStream";
-import { ratePerSecond, pushSample, type Sample } from "./lib/series";
+import { processedDelta, pushSample } from "./lib/series";
 import { listDlq, requeue, type DlqJob } from "./api";
 import { Sidebar } from "./components/Sidebar";
 import { StatTiles } from "./components/StatTiles";
@@ -20,7 +20,7 @@ export function App() {
   const [dlq, setDlq] = useState<DlqJob[]>([]);
   const [showEnqueue, setShowEnqueue] = useState(false);
   const [helpOpen, setHelpOpen] = useState(false);
-  const prevSample = useRef<Sample | null>(null);
+  const prevProcessed = useRef<number | null>(null);
 
   // Auto-open the help overlay on a visitor's first load.
   useEffect(() => {
@@ -37,7 +37,7 @@ export function App() {
   useEffect(() => {
     setDepth([]);
     setThroughput([]);
-    prevSample.current = null;
+    prevProcessed.current = null;
   }, [selected]);
 
   const snap = selected ? byQueue[selected] : undefined;
@@ -46,12 +46,13 @@ export function App() {
   useEffect(() => {
     if (!snap) return;
     setDepth((d) => pushSample(d, snap.ready, WINDOW));
-    const cur: Sample = { value: snap.processed_total, t: Date.now() };
-    if (prevSample.current) {
-      const rate = ratePerSecond(prevSample.current, cur);
-      setThroughput((t) => pushSample(t, rate, WINDOW));
+    // Throughput is the per-snapshot processed delta (server pushes ~1/s), not a
+    // wall-clock rate — see processedDelta: immune to SSE arrival jitter/bunching.
+    if (prevProcessed.current !== null) {
+      const delta = processedDelta(prevProcessed.current, snap.processed_total);
+      setThroughput((t) => pushSample(t, delta, WINDOW));
     }
-    prevSample.current = cur;
+    prevProcessed.current = snap.processed_total;
   }, [snap]);
 
   // Load the DLQ for the selected queue, refreshed on a slow timer.
