@@ -39,7 +39,7 @@ type hub struct {
 	mu     sync.Mutex
 	subs   map[*subscriber]struct{}
 	last   []byte             // most-recent marshalled snapshot, for instant populate
-	cancel context.CancelFunc // non-nil iff the poller goroutine is running
+	cancel context.CancelFunc // non-nil iff a poller should be running (see run for the restart-overlap window)
 }
 
 // newHub builds an idle hub. It does not poll until the first subscribe.
