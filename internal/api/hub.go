@@ -101,9 +101,11 @@ func (h *hub) unsubscribe(s *subscriber) {
 // pollAndBroadcast, which takes h.mu; subscribe holds h.mu while it installs the
 // new cancel and starts the new run, so an old in-flight broadcast either ran
 // before subscribe took the lock (harmless: it writes a fresh snapshot to the
-// current subs) or blocks until subscribe unlocks and then returns on its own
-// ctx.Done(). The old context is independent of the new one, so a stale poller
-// can never cancel the new one — at worst it performs one extra Redis poll.
+// current subs) or blocks until subscribe unlocks, then completes one final
+// broadcast to the current subs (including the new subscriber) before its next
+// select returns on its own ctx.Done(). The old context is independent of the
+// new one, so a stale poller can never cancel the new one — at worst it does one
+// extra poll and broadcast, which the new poller's latest-wins delivery absorbs.
 func (h *hub) run(ctx context.Context) {
 	h.pollAndBroadcast(ctx)
 	ticker := time.NewTicker(h.interval)
@@ -135,11 +137,20 @@ func (h *hub) pollAndBroadcast(ctx context.Context) {
 	for _, q := range queues {
 		st, err := h.src.Stats(ctx, q)
 		if err != nil {
+			// A cancelled context means the poller is shutting down (last
+			// subscriber left): abandon the whole tick silently, like the Queues
+			// path above. A genuine per-queue error just omits that queue.
+			if errors.Is(err, context.Canceled) {
+				return
+			}
 			h.logger.Error("api: stream stats", "queue", q, "err", err)
 			continue
 		}
 		ct, err := h.src.Counters(ctx, q)
 		if err != nil {
+			if errors.Is(err, context.Canceled) {
+				return
+			}
 			h.logger.Error("api: stream counters", "queue", q, "err", err)
 			continue
 		}
