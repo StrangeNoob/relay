@@ -19,6 +19,7 @@ import (
 type API struct {
 	broker *broker.Broker
 	logger *slog.Logger
+	hub    *hub
 }
 
 // New returns an http.Handler serving the Relay REST API over the given broker.
@@ -29,6 +30,7 @@ func New(b *broker.Broker, logger *slog.Logger) http.Handler {
 		logger = slog.Default()
 	}
 	a := &API{broker: b, logger: logger}
+	a.hub = newHub(b, logger, streamInterval)
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /api/queues/{queue}/jobs", a.enqueue)
 	mux.HandleFunc("POST /api/queues/{queue}/jobs/bulk", a.enqueueBulk)
