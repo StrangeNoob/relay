@@ -1,4 +1,4 @@
-import { useEffect } from "react";
+import { useEffect, useRef } from "react";
 
 interface HelpOverlayProps {
   open: boolean;
@@ -9,13 +9,20 @@ interface HelpOverlayProps {
 // job lifecycle (Ready -> In-flight -> done, with retry/Delayed and Dead-letter
 // branches). Closing is handled by the parent (which records "seen").
 export function HelpOverlay({ open, onClose }: HelpOverlayProps) {
+  const modalRef = useRef<HTMLDivElement>(null);
+
   useEffect(() => {
     if (!open) return;
+    const previouslyFocused = document.activeElement as HTMLElement | null;
+    modalRef.current?.focus();
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") onClose();
     };
     window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
+    return () => {
+      window.removeEventListener("keydown", onKey);
+      previouslyFocused?.focus?.();
+    };
   }, [open, onClose]);
 
   if (!open) return null;
@@ -23,6 +30,8 @@ export function HelpOverlay({ open, onClose }: HelpOverlayProps) {
   return (
     <div className="help-backdrop" onClick={onClose}>
       <div
+        ref={modalRef}
+        tabIndex={-1}
         className="help-modal"
         role="dialog"
         aria-modal="true"
