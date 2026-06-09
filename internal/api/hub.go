@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"sync"
 	"time"
@@ -92,6 +93,17 @@ func (h *hub) unsubscribe(s *subscriber) {
 
 // run is the single poller goroutine: an immediate snapshot, then one per
 // interval until ctx is cancelled (by the last unsubscribe or server shutdown).
+//
+// Restart-overlap safety: if a subscribe arrives just after the last
+// unsubscribe cancelled this goroutine, subscribe starts a NEW run with its own
+// context while this one may not have returned yet. That is safe — this
+// goroutine's only post-cancel access to shared state is the broadcast block in
+// pollAndBroadcast, which takes h.mu; subscribe holds h.mu while it installs the
+// new cancel and starts the new run, so an old in-flight broadcast either ran
+// before subscribe took the lock (harmless: it writes a fresh snapshot to the
+// current subs) or blocks until subscribe unlocks and then returns on its own
+// ctx.Done(). The old context is independent of the new one, so a stale poller
+// can never cancel the new one — at worst it performs one extra Redis poll.
 func (h *hub) run(ctx context.Context) {
 	h.pollAndBroadcast(ctx)
 	ticker := time.NewTicker(h.interval)
@@ -112,7 +124,11 @@ func (h *hub) run(ctx context.Context) {
 func (h *hub) pollAndBroadcast(ctx context.Context) {
 	queues, err := h.src.Queues(ctx)
 	if err != nil {
-		h.logger.Error("api: stream listing queues", "err", err)
+		// A cancelled context means the last subscriber just left and the poller
+		// is shutting down; that is expected, not an error worth logging.
+		if !errors.Is(err, context.Canceled) {
+			h.logger.Error("api: stream listing queues", "err", err)
+		}
 		return
 	}
 	snaps := make([]queueSnapshot, 0, len(queues))
