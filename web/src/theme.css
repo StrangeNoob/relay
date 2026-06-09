@@ -153,9 +153,9 @@ td.empty { color: var(--faint); text-align: center; padding: 22px; font-family: 
 @keyframes help-dead {
   0% { left: 92px; top: 112px; opacity: 0; }
   10% { opacity: 1; }
-  28% { left: 330px; top: 112px; }
-  46% { left: 336px; top: 196px; }
-  70% { left: 612px; top: 196px; }
+  30% { left: 330px; top: 112px; }
+  48% { left: 406px; top: 196px; }
+  78% { left: 612px; top: 196px; }
   100% { left: 612px; top: 196px; opacity: 1; }
 }
 .help-caps { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; padding: 8px 26px 4px; }
@@ -169,7 +169,7 @@ td.empty { color: var(--faint); text-align: center; padding: 22px; font-family: 
 @media (prefers-reduced-motion: reduce) {
   .help-tok { animation: none !important; }
   .help-h2, .help-h3, .help-rt, .help-dd { opacity: 1; }
-  .help-h1 { left: 120px; top: 112px; }
+  .help-h1 { left: 120px; top: 112px; opacity: 1; }
   .help-h2 { left: 330px; top: 112px; }
   .help-h3 { left: 600px; top: 112px; }
   .help-rt { left: 336px; top: 196px; }

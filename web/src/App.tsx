@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useStream } from "./hooks/useStream";
 import { ratePerSecond, pushSample, type Sample } from "./lib/series";
 import { listDlq, requeue, type DlqJob } from "./api";
@@ -76,10 +76,10 @@ export function App() {
     if (selected) listDlq(selected).then(setDlq).catch(() => {});
   };
 
-  const closeHelp = () => {
+  const closeHelp = useCallback(() => {
     markSeen(localStorage);
     setHelpOpen(false);
-  };
+  }, []);
 
   return (
     <div className="app">
