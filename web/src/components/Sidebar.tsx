@@ -30,7 +30,7 @@ export function Sidebar({ queues, byQueue, selected, connected, onSelect, onEnqu
         <button className="enq" onClick={onEnqueueClick}>+ Enqueue a job</button>
         <div className="conn">
           <span className={"live" + (connected ? "" : " off")} /> {connected ? "live · 1s" : "offline"}
-          <button className="help-q" onClick={onHelpClick} aria-label="What is Relay?" title="What is Relay?">?</button>
+          <button type="button" className="help-q" onClick={onHelpClick} aria-label="What is Relay?" title="What is Relay?">?</button>
         </div>
       </div>
     </aside>
