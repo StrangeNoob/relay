@@ -8,9 +8,10 @@ interface SidebarProps {
   connected: boolean;
   onSelect: (q: string) => void;
   onEnqueueClick: () => void;
+  onHelpClick: () => void;
 }
 
-export function Sidebar({ queues, byQueue, selected, connected, onSelect, onEnqueueClick }: SidebarProps) {
+export function Sidebar({ queues, byQueue, selected, connected, onSelect, onEnqueueClick, onHelpClick }: SidebarProps) {
   return (
     <aside className="side">
       <div>
@@ -29,6 +30,7 @@ export function Sidebar({ queues, byQueue, selected, connected, onSelect, onEnqu
         <button className="enq" onClick={onEnqueueClick}>+ Enqueue a job</button>
         <div className="conn">
           <span className={"live" + (connected ? "" : " off")} /> {connected ? "live · 1s" : "offline"}
+          <button className="help-q" onClick={onHelpClick} aria-label="What is Relay?" title="What is Relay?">?</button>
         </div>
       </div>
     </aside>

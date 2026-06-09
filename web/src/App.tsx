@@ -7,6 +7,8 @@ import { StatTiles } from "./components/StatTiles";
 import { Charts } from "./components/Charts";
 import { DlqTable } from "./components/DlqTable";
 import { EnqueueForm } from "./components/EnqueueForm";
+import { HelpOverlay } from "./components/HelpOverlay";
+import { shouldAutoOpen, markSeen } from "./lib/help";
 
 const WINDOW = 60;
 
@@ -17,7 +19,13 @@ export function App() {
   const [throughput, setThroughput] = useState<number[]>([]);
   const [dlq, setDlq] = useState<DlqJob[]>([]);
   const [showEnqueue, setShowEnqueue] = useState(false);
+  const [helpOpen, setHelpOpen] = useState(false);
   const prevSample = useRef<Sample | null>(null);
+
+  // Auto-open the help overlay on a visitor's first load.
+  useEffect(() => {
+    if (shouldAutoOpen(localStorage)) setHelpOpen(true);
+  }, []);
 
   // Default the selection to the first queue once queues arrive.
   useEffect(() => {
@@ -68,6 +76,11 @@ export function App() {
     if (selected) listDlq(selected).then(setDlq).catch(() => {});
   };
 
+  const closeHelp = () => {
+    markSeen(localStorage);
+    setHelpOpen(false);
+  };
+
   return (
     <div className="app">
       <Sidebar
@@ -77,6 +90,7 @@ export function App() {
         connected={connected}
         onSelect={setSelected}
         onEnqueueClick={() => setShowEnqueue(true)}
+        onHelpClick={() => setHelpOpen(true)}
       />
       <main className="main">
         <div className="crumb">queue</div>
@@ -90,6 +104,7 @@ export function App() {
       {showEnqueue && selected && (
         <EnqueueForm queue={selected} onClose={() => setShowEnqueue(false)} onEnqueued={onEnqueued} />
       )}
+      <HelpOverlay open={helpOpen} onClose={closeHelp} />
     </div>
   );
 }

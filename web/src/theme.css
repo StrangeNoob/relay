@@ -175,3 +175,5 @@ td.empty { color: var(--faint); text-align: center; padding: 22px; font-family: 
   .help-rt { left: 336px; top: 196px; }
   .help-dd { left: 612px; top: 196px; }
 }
+.conn .help-q { margin-left: auto; width: 18px; height: 18px; border-radius: 50%; border: 1px solid var(--line); background: transparent; color: var(--muted); font-family: var(--sans); font-size: 11px; line-height: 1; cursor: pointer; display: inline-flex; align-items: center; justify-content: center; }
+.conn .help-q:hover { border-color: var(--accent); color: var(--accent); }
