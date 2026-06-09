@@ -217,6 +217,65 @@ func (b *Broker) Enqueue(ctx context.Context, j job.Job, opts ...EnqueueOption) 
 	return nil
 }
 
+// EnqueueBulk enqueues many jobs (all on their own queue) in a single Redis
+// pipeline and returns the number enqueued. The shared delay/priority options
+// apply to every job. Unlike Enqueue it does NOT dedup — bulk is for volume, and
+// every job.New already has a unique id, so jobs are distinct even with identical
+// payloads. It reuses the same atomic enqueue.lua per job.
+func (b *Broker) EnqueueBulk(ctx context.Context, jobs []job.Job, opts ...EnqueueOption) (int, error) {
+	if len(jobs) == 0 {
+		return 0, nil
+	}
+	var cfg enqueueConfig
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+	now := time.Now()
+
+	// Ensure the script is cached so the pipelined EVALSHA calls don't NOSCRIPT
+	// (a pipeline can't auto-fallback to EVAL mid-flight).
+	if err := enqueueScript.Load(ctx, b.rdb).Err(); err != nil {
+		return 0, fmt.Errorf("broker: loading enqueue script: %w", err)
+	}
+
+	pipe := b.rdb.Pipeline()
+	for i := range jobs {
+		j := jobs[i]
+		if cfg.prioritySet {
+			j.Priority = cfg.priority
+		}
+		j.Priority = clampPriority(j.Priority)
+
+		var targetKey string
+		var score float64
+		if cfg.readyAt.After(now) {
+			j.State = job.StateDelayed
+			targetKey = delayedKey(j.Queue)
+			score = float64(cfg.readyAt.UnixMilli())
+		} else {
+			j.State = job.StateReady
+			targetKey = readyKey(j.Queue)
+			score = readyScore(j.Priority, now.UnixMilli())
+		}
+
+		// Bulk never dedups: useDedup "0", no TTL, empty dedup key.
+		h := j.ToHash()
+		args := make([]any, 0, 4+2*len(h))
+		args = append(args, j.ID, score, 0, "0")
+		for k, v := range h {
+			args = append(args, k, v)
+		}
+		enqueueScript.Run(ctx, pipe, []string{jobKey(j.ID), targetKey, ""}, args...)
+	}
+	if _, err := pipe.Exec(ctx); err != nil {
+		return 0, fmt.Errorf("broker: bulk enqueue: %w", err)
+	}
+	for i := range jobs {
+		b.metrics.IncEnqueued(jobs[i].Queue)
+	}
+	return len(jobs), nil
+}
+
 // Claim atomically takes the highest-priority ready job from the queue, moves it
 // into the inflight set under a deadline of now+visibility, bumps its attempt
 // count, and returns it. The ok return is false (with a nil error) when the

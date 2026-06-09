@@ -70,6 +70,25 @@ func TestRoundTripEnqueueStatsQueues(t *testing.T) {
 	}
 }
 
+func TestRoundTripEnqueueBulk(t *testing.T) {
+	c, _, _ := newRoundTrip(t)
+	ctx := context.Background()
+	res, err := c.EnqueueBulk(ctx, "emails", []byte(`{"n":1}`), 25)
+	if err != nil {
+		t.Fatalf("EnqueueBulk: %v", err)
+	}
+	if res.Enqueued != 25 {
+		t.Errorf("enqueued = %d, want 25", res.Enqueued)
+	}
+	s, err := c.Stats(ctx, "emails")
+	if err != nil {
+		t.Fatalf("Stats: %v", err)
+	}
+	if s.Ready != 25 {
+		t.Errorf("ready = %d, want 25", s.Ready)
+	}
+}
+
 func TestRoundTripDLQListAndRequeue(t *testing.T) {
 	c, b, _ := newRoundTrip(t)
 	ctx := context.Background()

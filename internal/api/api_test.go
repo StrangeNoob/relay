@@ -229,6 +229,49 @@ func TestQueuesEndpointListsNames(t *testing.T) {
 	}
 }
 
+func TestBulkEnqueue(t *testing.T) {
+	h, _, rdb := newTestAPI(t)
+	rec := do(t, h, http.MethodPost, "/api/queues/emails/jobs/bulk", map[string]any{"count": 50, "payload": "x"})
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201; body=%s", rec.Code, rec.Body.String())
+	}
+	var resp struct {
+		Enqueued int    `json:"enqueued"`
+		State    string `json:"state"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.Enqueued != 50 || resp.State != "ready" {
+		t.Errorf("resp = %+v, want {50 ready}", resp)
+	}
+	if c := rdb.ZCard(context.Background(), "q:emails:ready").Val(); c != 50 {
+		t.Errorf("ready = %d, want 50", c)
+	}
+}
+
+func TestBulkEnqueueRejectsBadCount(t *testing.T) {
+	h, _, _ := newTestAPI(t)
+	for _, c := range []int{0, 10001} {
+		rec := do(t, h, http.MethodPost, "/api/queues/emails/jobs/bulk", map[string]any{"count": c, "payload": "x"})
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("count=%d: status = %d, want 400", c, rec.Code)
+		}
+	}
+}
+
+func TestBulkEnqueueDelayedState(t *testing.T) {
+	h, _, _ := newTestAPI(t)
+	rec := do(t, h, http.MethodPost, "/api/queues/emails/jobs/bulk", map[string]any{"count": 3, "payload": "x", "delay_ms": 60000})
+	var resp struct {
+		State string `json:"state"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &resp)
+	if rec.Code != http.StatusCreated || resp.State != "delayed" {
+		t.Errorf("got %d %s, want 201 delayed", rec.Code, resp.State)
+	}
+}
+
 func TestStreamEmitsSnapshot(t *testing.T) {
 	h, b, _ := newTestAPI(t)
 	if err := b.Enqueue(context.Background(), mustJob("emails", "x")); err != nil {

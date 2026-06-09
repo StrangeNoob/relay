@@ -19,7 +19,7 @@ green. Only "Future work" items (Postgres SKIP LOCKED mode, exactly-once outbox)
 were always out of scope. Repo: <https://github.com/StrangeNoob/relay>. What exists today:
 
 - `internal/job` — the `Job` model + Redis-hash encoding (`ToHash`/`FromHash`).
-- `internal/broker` — `Enqueue` (with `WithDelay`/`WithReadyAt`/`WithPriority`/`WithIdempotencyKey` options), atomic `Claim`, `Ack`,
+- `internal/broker` — `Enqueue` (with `WithDelay`/`WithReadyAt`/`WithPriority`/`WithIdempotencyKey` options), `EnqueueBulk(ctx, jobs []job.Job, opts...)` (pipelines N `enqueue.lua` calls in one round-trip; no dedup; emits one metric per job), atomic `Claim`, `Ack`,
   `Nack` (full-jitter backoff via the delayed set), `Reap`, `Promote`, `Extend` (heartbeat),
   `Stats` (ZCARD/LLEN snapshot per queue), `ListDLQ` (paged DLQ inspection), `RequeueDLQ`
   (atomic dlq→ready reset via `requeue.lua`), `Queues` (SCAN-based queue discovery),
@@ -36,7 +36,9 @@ were always out of scope. Repo: <https://github.com/StrangeNoob/relay>. What exi
 - `internal/worker` — `Worker` (claim loop, dispatch, heartbeat, graceful shutdown), plus `Reaper`
   and `Promoter` background loops sharing one `runDrainLoop` helper.
 - `internal/api` — JSON REST API over stdlib `net/http` (Go 1.22 method+path routing). Endpoints:
-  `POST /api/queues/{queue}/jobs` (enqueue; 409 on idempotency dup), `GET /api/queues/{queue}/stats`,
+  `POST /api/queues/{queue}/jobs` (enqueue; 409 on idempotency dup),
+  `POST /api/queues/{queue}/jobs/bulk` (bulk enqueue; body `{count,payload,priority?,delay_ms?}`; count 1–10000, 400 otherwise; no idempotency; returns `{enqueued,state}`; implemented in `internal/api/bulk.go`),
+  `GET /api/queues/{queue}/stats`,
   `GET /api/queues/{queue}/dlq?limit=&offset=`, `POST /api/queues/{queue}/dlq/{id}/requeue`
   (404 if not in DLQ), `GET /api/queues`, `GET /api/stream` (SSE; pushes per-queue depth +
   `processed`/`dead` counters to every connected dashboard every ~1 s; implemented in
@@ -44,6 +46,7 @@ were always out of scope. Repo: <https://github.com/StrangeNoob/relay>. What exi
 - `internal/client` — stdlib-only HTTP producer SDK (no broker/job/redis import; no new Go
   dependency). `New(baseURL, ...Option)` (options: `WithHTTPClient`, `WithTimeout`). Methods:
   `Enqueue` (with `WithDelay`/`WithPriority`/`WithIdempotencyKey`; maps 409 → `ErrDuplicate`),
+  `EnqueueBulk(ctx, queue, payload, count, opts...) (BulkResult, error)` (bulk variant; `WithIdempotencyKey` is ignored),
   `Stats`, `ListDLQ`, `Requeue` (maps 404 → `ErrNotFound`), `Queues`. Typed errors:
   `ErrDuplicate`, `ErrNotFound`, `APIError`.
 - `cmd/worker`, `cmd/demo` — thin runnable entrypoints. `cmd/worker`: worker pool + reaper +
@@ -57,9 +60,11 @@ were always out of scope. Repo: <https://github.com/StrangeNoob/relay>. What exi
   collector).
 - `web/` — Vite+React+TypeScript dark-editorial dashboard. Source under `web/src/`; production
   build committed to `web/dist/` (embedded via `web/embed.go` using `go:embed`, served at `/` by
-  `cmd/server` with SPA index.html fallback). Includes vitest unit tests for pure logic
-  (format helpers, series builders) and a snapshot test. `web/` has its own `package.json`; the
-  Go module gains no dependency.
+  `cmd/server` with SPA index.html fallback). The enqueue form has a Count field (default 1;
+  values >1 trigger a bulk request via `POST .../jobs/bulk`; clamped to 1–10000 by the
+  `clampCount` helper in `web/src/lib/count.ts`). Includes vitest unit tests for pure logic
+  (format helpers, series builders, clampCount) and a snapshot test. `web/` has its own
+  `package.json`; the Go module gains no dependency.
 - `Dockerfile` — multi-stage distroless image; builds all three binaries (`cmd/server`,
   `cmd/worker`, `cmd/demo`) into one shared image (compose tags it `relay:local`).
 - `.dockerignore` — trims the Docker build context (excludes `.git`, `web/node_modules`,
@@ -114,6 +119,7 @@ spec disagree, the spec wins until the spec is deliberately updated.
 - **SSE is per-connection.** Each open dashboard tab runs its own server-side ticker goroutine reading Redis every ~1 s. This is fine for a demo; a production deployment would fan-out from a single poller.
 - **Committed `web/dist` must be rebuilt on UI change.** The Go binary embeds the committed dist; CI has a `git diff --exit-code -- dist` step to catch stale builds. Run `cd web && npm run build` and commit the updated dist whenever source changes.
 - **Producer SDK does no client-side retries.** `internal/client` makes one HTTP request per call; transient failures are surfaced as errors. The caller is responsible for retry logic (with backoff) if needed.
+- **Bulk enqueue returns a count, not per-job IDs.** `POST .../jobs/bulk` (and `client.EnqueueBulk`) returns only `{enqueued, state}` — individual job IDs are not surfaced. Bulk has no idempotency support (`WithIdempotencyKey` is silently ignored). The cap is 10 000 jobs per request. All jobs in one bulk call must belong to the same queue.
 - **`cmd/demo` requires a running `cmd/server`.** The demo load generator now produces jobs through the HTTP SDK (`-server` flag) and no longer talks to Redis directly. Running `cmd/demo` without `cmd/server` will produce connection errors immediately.
 - **Docker/Compose packaging notes.** The compose Redis has no volume mount — data is ephemeral and lost on `docker compose down`. The `demo` service is one-shot (exits 0 after enqueuing; `restart: on-failure` lets it retry through the brief server-startup race); workers and server continue running. The distroless image has no shell (`/bin/sh` is absent), so `docker exec` interactive debugging is not available. Deploying to a live environment (Railway, Fly.io, etc.) is the operator's step; the compose stack is a local demo, not a production-hardened deployment.
 
