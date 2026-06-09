@@ -31,6 +31,7 @@ func New(b *broker.Broker, logger *slog.Logger) http.Handler {
 	a := &API{broker: b, logger: logger}
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /api/queues/{queue}/jobs", a.enqueue)
+	mux.HandleFunc("POST /api/queues/{queue}/jobs/bulk", a.enqueueBulk)
 	mux.HandleFunc("GET /api/queues/{queue}/stats", a.stats)
 	mux.HandleFunc("GET /api/queues/{queue}/dlq", a.listDLQ)
 	mux.HandleFunc("POST /api/queues/{queue}/dlq/{id}/requeue", a.requeueDLQ)
