@@ -182,6 +182,37 @@ func (c *Client) Requeue(ctx context.Context, queue, id string) error {
 	return err
 }
 
+// BulkResult is the response from a bulk enqueue.
+type BulkResult struct {
+	Enqueued int    `json:"enqueued"`
+	State    string `json:"state"`
+}
+
+// bulkBody is the JSON request for a bulk enqueue.
+type bulkBody struct {
+	Count    int    `json:"count"`
+	Payload  string `json:"payload"`
+	DelayMs  int64  `json:"delay_ms,omitempty"`
+	Priority *int   `json:"priority,omitempty"`
+}
+
+// EnqueueBulk enqueues count copies of payload onto a queue in one request.
+// WithDelay/WithPriority apply to all jobs; WithIdempotencyKey is ignored (bulk
+// has no dedup).
+func (c *Client) EnqueueBulk(ctx context.Context, queue string, payload []byte, count int, opts ...EnqueueOption) (BulkResult, error) {
+	// Reuse the enqueue options to capture delay/priority, then map to bulkBody.
+	var eb enqueueBody
+	for _, opt := range opts {
+		opt(&eb)
+	}
+	body := bulkBody{Count: count, Payload: string(payload), DelayMs: eb.DelayMs, Priority: eb.Priority}
+	var res BulkResult
+	if err := c.do(ctx, http.MethodPost, "/api/queues/"+url.PathEscape(queue)+"/jobs/bulk", body, &res); err != nil {
+		return BulkResult{}, err
+	}
+	return res, nil
+}
+
 // do performs a request with an optional JSON body, decoding a 2xx JSON response
 // into out (when non-nil). Non-2xx responses become an *APIError carrying the
 // status and the {"error":...} message; transport/marshal errors are wrapped.

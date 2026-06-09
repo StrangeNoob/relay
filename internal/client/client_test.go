@@ -193,3 +193,30 @@ func TestRequeueOKAndNotFound(t *testing.T) {
 		t.Errorf("err = %v, want ErrNotFound", err)
 	}
 }
+
+func TestEnqueueBulkSendsCountAndDecodes(t *testing.T) {
+	var gotPath string
+	var gotBody map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		_ = json.NewDecoder(r.Body).Decode(&gotBody)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"enqueued":200,"state":"ready"}`))
+	}))
+	defer srv.Close()
+	c := client.New(srv.URL)
+	res, err := c.EnqueueBulk(context.Background(), "emails", []byte("hi"), 200, client.WithPriority(5))
+	if err != nil {
+		t.Fatalf("EnqueueBulk: %v", err)
+	}
+	if res.Enqueued != 200 || res.State != "ready" {
+		t.Errorf("res = %+v, want {200 ready}", res)
+	}
+	if gotPath != "/api/queues/emails/jobs/bulk" {
+		t.Errorf("path = %s", gotPath)
+	}
+	if gotBody["count"].(float64) != 200 || gotBody["payload"] != "hi" || gotBody["priority"].(float64) != 5 {
+		t.Errorf("body = %v", gotBody)
+	}
+}
